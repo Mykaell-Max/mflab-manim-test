@@ -49,12 +49,20 @@ COMPONENTS_TO_CACHE = ("u", "v", "w", "pressure", "dwall_s")
 WAKE_MODE = "q"
 WAKE_SPEED = 0.80
 
-# Percentil global de Q positivo usado como limiar. Fixo entre frames.
-Q_PERCENTILE = 99.7
+# Limiar da isosuperfície em unidades normalizadas Q* = Q / (U/D)², com U a
+# velocidade de referência do escoamento livre e D o diâmetro da esfera.
+# Normalizar assim mantém o limiar comparável entre resoluções e casos; um
+# percentil, não: o conjunto de Q positivo é uma fração ínfima do domínio,
+# e qualquer percentil alto sobre ele aterrissa junto ao máximo.
+REFERENCE_VELOCITY = 1.0
+Q_STAR_LEVEL = 0.10
+# Níveis apenas reportados, para escolher Q_STAR_LEVEL com dado na mão.
+Q_STAR_REPORT = (0.01, 0.02, 0.05, 0.10, 0.20, 0.50, 1.00)
+
 # Células mascaradas ao redor do sólido: a interface imersa produz gradientes
-# numéricos enormes que virariam uma casca espúria em torno da esfera.
-Q_MASK_CELLS = 2.0
-Q_SAMPLES_PER_FRAME = 250_000
+# numéricos que virariam uma casca espúria. Manter o mais estreito possível —
+# a camada cisalhante junto à parede é física, e é onde a vorticidade nasce.
+Q_MASK_CELLS = 1.0
 
 # --- streamlines -------------------------------------------------------------
 # Anéis concêntricos a montante da esfera, em múltiplos do raio.
@@ -670,12 +678,19 @@ def build_scene(cache_files: list[Path], force: bool = False):
         tuple(center) if center is not None else reference.center
     )
 
+    # (U/D)²: converte Q absoluto em Q* adimensional.
+    q_scale = (
+        1.0
+        if not radius
+        else (REFERENCE_VELOCITY / (2.0 * radius)) ** 2
+    )
+
     speed_minimum = np.inf
     speed_maximum = -np.inf
     q_blocks: dict[int, np.ndarray] = {}
-    q_samples: list[np.ndarray] = []
+    q_star_maximum = 0.0
+    q_star_counts = np.zeros(len(Q_STAR_REPORT), dtype=np.int64)
     times: dict[int, float] = {}
-    generator = np.random.default_rng(0)
 
     for index, path in enumerate(cache_files, start=1):
         step = timestep_number(path)
@@ -705,15 +720,15 @@ def build_scene(cache_files: list[Path], force: bool = False):
             del jacobian
             q_blocks[step] = block
 
-            positive = block[block > 0.0]
-            if positive.size:
-                sample_size = min(Q_SAMPLES_PER_FRAME, positive.size)
-                q_samples.append(
-                    generator.choice(positive, sample_size, replace=False)
+            for position, q_star in enumerate(Q_STAR_REPORT):
+                q_star_counts[position] += int(
+                    (block > q_star * q_scale).sum()
                 )
+            q_star_maximum = max(q_star_maximum, masked_maximum / q_scale)
             q_report = (
-                f" • Q max {masked_maximum:.4g} "
-                f"(bruto {raw_maximum:.4g}, {positive.size:,} pts > 0)"
+                f" • Q* max {masked_maximum / q_scale:.3g} "
+                f"(bruto {raw_maximum / q_scale:.3g}, "
+                f"{int((block > 0.0).sum()):,} pts > 0)"
             )
 
         elapsed = time.perf_counter() - started
@@ -726,27 +741,38 @@ def build_scene(cache_files: list[Path], force: bool = False):
         )
 
     if WAKE_MODE == "q":
-        if q_samples:
-            pooled = np.concatenate(q_samples)
-            wake_level = float(np.percentile(pooled, Q_PERCENTILE))
-            scale = 1.0 if radius is None else (1.0 / (2.0 * radius)) ** 2
-            print(
-                f"Limiar global de Q: {wake_level:.4g} "
-                f"(percentil {Q_PERCENTILE}) • Q* = Q/(U/D)² = "
-                f"{wake_level / scale:.4g}"
-            )
-        else:
+        print(
+            f"D = {2.0 * (radius or 0.0):.4f} • U = {REFERENCE_VELOCITY:g} "
+            f"• (U/D)² = {q_scale:.4g} • Q* máximo observado "
+            f"{q_star_maximum:.3g}"
+        )
+        print("  pontos acima de cada Q*, somados sobre os frames:")
+        for q_star, count in zip(Q_STAR_REPORT, q_star_counts):
+            marker = " <- Q_STAR_LEVEL" if q_star == Q_STAR_LEVEL else ""
+            print(f"    Q* >= {q_star:<5g} {count:>12,}{marker}")
+
+        if q_star_maximum <= 0.0:
             # Campo uniforme (tipicamente a condição inicial) produz Q = 0
             # em todo o domínio. É o resultado correto, não uma falha:
             # não existe vórtice em t = 0.
             wake_level = None
             print(
-                "Nenhum valor positivo de Q em nenhum frame. Se estes são "
-                "só os primeiros timesteps, isso é esperado; a cena fica "
-                "sem superfície de vórtice. Se timesteps desenvolvidos "
-                "também derem zero, compare 'Q max' com 'bruto' acima: "
-                "iguais e nulos indicam campo sem vorticidade, bruto alto "
-                "com máscara nula indica Q_MASK_CELLS larga demais."
+                "  Nenhum Q positivo. Esperado para a condição inicial; a "
+                "cena fica sem superfície de vórtice. Em timesteps "
+                "desenvolvidos, compare 'Q* max' com 'bruto': se o bruto "
+                "for alto e o mascarado nulo, Q_MASK_CELLS está largo."
+            )
+        else:
+            wake_level = Q_STAR_LEVEL * q_scale
+            if Q_STAR_LEVEL > q_star_maximum:
+                print(
+                    f"  AVISO: Q_STAR_LEVEL ({Q_STAR_LEVEL:g}) excede o "
+                    f"máximo observado ({q_star_maximum:.3g}). A "
+                    "isosuperfície ficará vazia."
+                )
+            print(
+                f"  limiar: Q* = {Q_STAR_LEVEL:g} → Q = {wake_level:.4g} "
+                "(fixo entre todos os frames)"
             )
     else:
         wake_level = WAKE_SPEED
@@ -796,7 +822,8 @@ def build_scene(cache_files: list[Path], force: bool = False):
         "target_dx": TARGET_DX,
         "wake_mode": WAKE_MODE,
         "wake_level": wake_level,
-        "q_percentile": Q_PERCENTILE if WAKE_MODE == "q" else None,
+        "q_star": Q_STAR_LEVEL if WAKE_MODE == "q" else None,
+        "q_scale": q_scale if WAKE_MODE == "q" else None,
         "speed_range": [speed_minimum, speed_maximum],
         "sphere_center": None if center is None else center.tolist(),
         "sphere_radius": radius,
@@ -993,7 +1020,9 @@ def view(metadata):
     if level is None:
         wake_label = "esteira: sem estrutura no intervalo processado"
     elif metadata["wake_mode"] == "q":
-        wake_label = f"esteira: Q = {level:.4g}"
+        wake_label = (
+            f"esteira: Q* = Q/(U/D)² = {metadata['q_star']:g}"
+        )
     else:
         wake_label = f"esteira: |u| = {level:.2f}"
     plotter.add_text(
@@ -1094,7 +1123,7 @@ def resolve_output_dir(explicit: str | None) -> Path:
 
 
 def main():
-    global OUTPUT_DIR, TARGET_DX, WAKE_MODE
+    global OUTPUT_DIR, TARGET_DX, WAKE_MODE, Q_STAR_LEVEL, Q_MASK_CELLS
 
     parser = argparse.ArgumentParser(
         description="Reconstrói AMR do MFSim e visualiza o escoamento."
@@ -1137,6 +1166,16 @@ def main():
         help="tipo de isosuperfície da esteira (padrão: q)",
     )
     parser.add_argument(
+        "--q-star",
+        type=float,
+        help=f"limiar Q/(U/D)² da esteira (padrão: {Q_STAR_LEVEL})",
+    )
+    parser.add_argument(
+        "--mask-cells",
+        type=float,
+        help=f"células mascaradas junto ao sólido (padrão: {Q_MASK_CELLS})",
+    )
+    parser.add_argument(
         "--dx",
         type=float,
         help=f"espaçamento alvo (padrão: {TARGET_DX})",
@@ -1148,6 +1187,10 @@ def main():
         TARGET_DX = args.dx
     if args.wake is not None:
         WAKE_MODE = args.wake
+    if args.q_star is not None:
+        Q_STAR_LEVEL = args.q_star
+    if args.mask_cells is not None:
+        Q_MASK_CELLS = args.mask_cells
 
     selected = args.preprocess or args.geometry or args.view
     run_preprocess = args.preprocess or not selected
