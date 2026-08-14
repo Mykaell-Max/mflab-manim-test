@@ -25,7 +25,7 @@ from pathlib import Path
 import h5py
 import numpy as np
 import pyvista as pv
-from scipy.ndimage import map_coordinates
+from scipy.ndimage import gaussian_filter, map_coordinates
 
 
 # -----------------------------------------------------------------------------
@@ -141,7 +141,27 @@ PARTICLE_TRANSIT_SECONDS = 7.0
 # enche o quadro de partículas em região onde o escoamento é uniforme.
 PARTICLE_SEED_RADII = 2.2
 
-SHOW_LIC = True
+# Volume rendering do campo de velocidade. Um plano de corte não sobrevive à
+# rotação de câmera: é um cartão plano, e ao orbitar fica evidente que não tem
+# profundidade. O volume tem.
+SHOW_VOLUME = True
+# Opacidade derivada do déficit de velocidade, 1 - |u|/U. No escoamento livre
+# o déficit é nulo e o volume fica transparente; só a esteira aparece. Usar
+# |u| direto encheria o domínio inteiro de névoa opaca.
+VOLUME_DEFICIT_FLOOR = 0.03
+VOLUME_DEFICIT_FULL = 0.55
+VOLUME_MAX_OPACITY = 0.22
+VOLUME_GAMMA = 1.35
+
+# Suavização casada ao nível AMR: cada região é borrada até o dx nativo do
+# nível que prevaleceu ali. Não é maquiagem — é remover detalhe que a
+# interpolação inventou. Sem isso o nível 0 (dx 0.032 amostrado a 0.002)
+# aparece como blocos retangulares.
+LEVEL_MATCHED_SMOOTHING = True
+
+# O corte com LIC é bonito de frente, mas plano. Desligado por padrão no
+# vídeo; ligue com --lic se a câmera não for orbitar.
+SHOW_LIC = False
 LIC_WIDTH = 1024
 LIC_STEPS = 48
 LIC_CYCLES = 3.0  # listras por janela de convolução
@@ -158,6 +178,7 @@ TEXT_COLOR = "#F1F6F9"
 # fundem numa massa só e o corpo parece deformado.
 GEOMETRY_COLOR = "#9AA6AE"
 WAKE_COLOR = "#37D6E8"
+TRACER_COLOR = "#E8F4FF"
 COLORMAP = "viridis"
 
 
@@ -1842,23 +1863,105 @@ def view(metadata):
 # Renderização de vídeo
 # -----------------------------------------------------------------------------
 
+def level_matched_smoothing(values, level, target_dx, base_dx=None):
+    """Suaviza cada região até a resolução nativa do seu nível AMR.
+
+    Onde o nível 0 prevaleceu, o dado tem dx = 0.032; amostrá-lo a 0.002
+    não acrescenta informação, só facetas de interpolação. Borrar com sigma
+    proporcional a dx_nativo/dx_alvo devolve o campo à banda que ele de fato
+    ocupa. É uma operação declarada, não um retoque: remove detalhe falso,
+    nunca detalhe medido.
+
+    A mistura usa o nível suavizado, para que a transição entre níveis não
+    troque um artefato de bloco por uma costura.
+    """
+    base_dx = base_dx or BASE_LEVEL_DX
+    levels = np.unique(level)
+    if len(levels) < 2:
+        return values
+
+    variants = {}
+    for value in levels:
+        ratio = (base_dx / 2 ** int(value)) / target_dx
+        sigma = max(ratio, 1.0) / 2.0
+        variants[int(value)] = (
+            gaussian_filter(values, sigma) if sigma > 0.6 else values
+        )
+
+    blended = gaussian_filter(level.astype(np.float32), 2.0)
+    blended = np.clip(blended, levels.min(), levels.max())
+
+    lower = np.floor(blended).astype(np.int8)
+    upper = np.minimum(lower + 1, int(levels.max()))
+    weight = (blended - lower).astype(np.float32)
+
+    result = np.zeros_like(values)
+    for value in levels:
+        key = int(value)
+        variant = variants[key]
+        result += np.where(lower == key, 1.0 - weight, 0.0) * variant
+        result += np.where(upper == key, weight, 0.0) * variant
+    return result
+
+
+def volume_opacity_curve(scalar_range, samples=256):
+    """Opacidade em função de |u|, via déficit de velocidade."""
+    values = np.linspace(scalar_range[0], scalar_range[1], samples)
+    deficit = 1.0 - values / REFERENCE_VELOCITY
+    normalized = np.clip(
+        (deficit - VOLUME_DEFICIT_FLOOR)
+        / max(VOLUME_DEFICIT_FULL - VOLUME_DEFICIT_FLOOR, 1.0e-9),
+        0.0,
+        1.0,
+    )
+    return (normalized ** VOLUME_GAMMA) * VOLUME_MAX_OPACITY
+
+
 def video_directory() -> Path:
     return scene_directory() / "video"
 
 
 def load_fields(cache_files):
-    """Campos de velocidade de todos os timesteps, em memória."""
-    fields, times = [], []
+    """Campos de velocidade e escalares do volume, em memória."""
+    fields, speeds, times = [], [], []
     origin = spacing = None
-    for path in cache_files:
+
+    for index, path in enumerate(cache_files, start=1):
         grid = pv.read(path)
+        shape = grid_shape(grid)
+        target_dx = float(grid.spacing[0])
         fields.append(as_vector_block(grid))
         times.append(physical_time(grid))
         origin = np.asarray(grid.origin, dtype=np.float32)
         spacing = np.asarray(grid.spacing, dtype=np.float32)
-    megabytes = sum(field.nbytes for field in fields) / 1024 ** 2
-    print(f"  {len(fields)} campos de velocidade • {megabytes:,.0f} MB")
-    return fields, np.asarray(times), origin, spacing
+
+        speed = as_block(
+            np.asarray(grid.point_data["velocity_magnitude"]), shape
+        ).astype(np.float32)
+
+        # Dentro do sólido |u| = 0, o que a curva de opacidade leria como
+        # esteira intensa e encheria a esfera de névoa. O corpo já é
+        # desenhado como superfície opaca; aqui ele vira escoamento livre.
+        distance = fluid_distance(grid)
+        if distance is not None:
+            solid = np.isfinite(distance) & (distance < 0.0)
+            speed[as_block(solid, shape)] = REFERENCE_VELOCITY
+
+        if LEVEL_MATCHED_SMOOTHING and "amr_level" in grid.point_data:
+            level = as_block(
+                np.asarray(grid.point_data["amr_level"]), shape
+            )
+            speed = level_matched_smoothing(speed, level, target_dx)
+
+        speeds.append(speed)
+        print(f"    campo {index}/{len(cache_files)}", flush=True)
+
+    megabytes = (
+        sum(field.nbytes for field in fields)
+        + sum(block.nbytes for block in speeds)
+    ) / 1024 ** 2
+    print(f"  {len(fields)} timesteps • {megabytes:,.0f} MB")
+    return fields, speeds, np.asarray(times), origin, spacing
 
 
 def plane_texture_image(luminance, vorticity, slice_range, table):
@@ -1933,7 +2036,7 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
     destination.mkdir(parents=True, exist_ok=True)
 
     print("Carregando campos...")
-    fields, times, origin, spacing = load_fields(cache_files)
+    fields, speeds, times, origin, spacing = load_fields(cache_files)
     shape = fields[0].shape[:3]
     bounds = (
         float(origin[0]),
@@ -2063,17 +2166,40 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
         reset_camera=False,
     )
 
+    volume_grid = None
+    if SHOW_VOLUME:
+        volume_grid = pv.ImageData(
+            dimensions=shape,
+            spacing=tuple(float(value) for value in spacing),
+            origin=tuple(float(value) for value in origin),
+        )
+        volume_grid.point_data["speed"] = speeds[0].ravel(order="F")
+        plotter.add_volume(
+            volume_grid,
+            scalars="speed",
+            cmap=COLORMAP,
+            clim=metadata["speed_range"],
+            opacity=volume_opacity_curve(metadata["speed_range"]),
+            shade=True,
+            ambient=0.35,
+            diffuse=0.80,
+            specular=0.15,
+            mapper="smart",
+            show_scalar_bar=False,
+            reset_camera=False,
+        )
+
     tracers = pv.PolyData()
     tracers.points = history.reshape(-1, 3)
     tracers.lines = connectivity
     tracers.point_data["speed"] = speed_history.ravel()
+    # Monocromático de propósito: com o volume já colorido por |u|, rastros
+    # em arco-íris competem com o campo e viram poluição em vez de leitura.
     tracer_actor = plotter.add_mesh(
         tracers,
-        scalars="speed",
-        cmap=COLORMAP,
-        clim=metadata["speed_range"],
+        color=TRACER_COLOR,
         line_width=PARTICLE_WIDTH,
-        opacity=0.85,
+        opacity=0.55,
         lighting=False,
         show_scalar_bar=False,
         reset_camera=False,
@@ -2172,6 +2298,11 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
             continue
 
         nearest = int(np.argmin(np.abs(times - physical)))
+        if nearest != current_wake and volume_grid is not None:
+            volume_grid.point_data["speed"] = speeds[nearest].ravel(
+                order="F"
+            )
+            volume_grid.Modified()
         if nearest != current_wake:
             wake_actor.mapper.SetInputData(
                 read_optional(
@@ -2257,7 +2388,7 @@ def resolve_output_dir(explicit: str | None) -> Path:
 def main():
     global OUTPUT_DIR, TARGET_DX, WAKE_MODE, Q_STAR_LEVEL, Q_MASK_DIAMETERS
     global CROP_LEVEL, SHOW_STREAMLINES, SLICE_SCALAR, SPHERE_MODE
-    global SHOW_LIC, VIDEO_SECONDS
+    global SHOW_LIC, VIDEO_SECONDS, SHOW_VOLUME, LEVEL_MATCHED_SMOOTHING
 
     parser = argparse.ArgumentParser(
         description="Reconstrói AMR do MFSim e visualiza o escoamento."
@@ -2295,9 +2426,19 @@ def main():
         help="renderiza só um frame do vídeo, para conferir antes",
     )
     parser.add_argument(
-        "--no-lic",
+        "--lic",
         action="store_true",
-        help="desliga a textura LIC no vídeo",
+        help="liga o corte com textura LIC (plano; ruim sob rotação)",
+    )
+    parser.add_argument(
+        "--no-volume",
+        action="store_true",
+        help="desliga o volume rendering do campo de velocidade",
+    )
+    parser.add_argument(
+        "--no-smoothing",
+        action="store_true",
+        help="não casa a suavização ao nível AMR (mostra os blocos)",
     )
     parser.add_argument(
         "--seconds",
@@ -2390,8 +2531,12 @@ def main():
         SLICE_SCALAR = args.slice_scalar
     if args.sphere is not None:
         SPHERE_MODE = args.sphere
-    if args.no_lic:
-        SHOW_LIC = False
+    if args.lic:
+        SHOW_LIC = True
+    if args.no_volume:
+        SHOW_VOLUME = False
+    if args.no_smoothing:
+        LEVEL_MATCHED_SMOOTHING = False
     if args.seconds is not None:
         VIDEO_SECONDS = args.seconds
 
