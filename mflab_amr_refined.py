@@ -60,6 +60,32 @@ def decode_name(value):
     return value.decode("utf-8") if isinstance(value, bytes) else str(value)
 
 
+def vector3_attribute(value, dtype=float, attribute_name="vetor"):
+    """Converte atributos HDF5 vetoriais simples ou estruturados."""
+    value_dtype = getattr(value, "dtype", None)
+    field_names = getattr(value_dtype, "names", None)
+
+    if field_names:
+        for candidate in (("x", "y", "z"), ("i", "j", "k")):
+            if all(name in field_names for name in candidate):
+                return np.array(
+                    [value[name] for name in candidate], dtype=dtype
+                )
+
+        raise ValueError(
+            f"{attribute_name} possui campos estruturados não reconhecidos: "
+            f"{field_names}"
+        )
+
+    result = np.asarray(value, dtype=dtype).reshape(-1)
+    if result.size != 3:
+        raise ValueError(
+            f"{attribute_name} deveria conter três valores, mas contém "
+            f"{result.size}: {value!r}"
+        )
+    return result
+
+
 def timestep_number(path: Path) -> int:
     return int(path.name.split(".")[-2])
 
@@ -110,8 +136,12 @@ def target_geometry(hdf: h5py.File):
         lo = domain[:3]
         hi = domain[3:]
 
-    coarse_dx = np.asarray(root.attrs["vec_dx"], dtype=float)
-    origin = np.asarray(hdf.attrs["origin"], dtype=float)
+    coarse_dx = vector3_attribute(
+        root.attrs["vec_dx"], dtype=float, attribute_name="vec_dx"
+    )
+    origin = vector3_attribute(
+        hdf.attrs["origin"], dtype=float, attribute_name="origin"
+    )
     physical_min = origin + lo * coarse_dx
     physical_max = origin + (hi + 1) * coarse_dx
 
@@ -133,8 +163,12 @@ def decode_level(hdf: h5py.File, level_index: int):
     group = hdf[f"level_{level_index}"]
     boxes = group["boxes"][:]
     raw = group["data:datatype=0"][:]
-    spacing = np.asarray(group.attrs["vec_dx"], dtype=float)
-    global_origin = np.asarray(hdf.attrs["origin"], dtype=float)
+    spacing = vector3_attribute(
+        group.attrs["vec_dx"], dtype=float, attribute_name="vec_dx"
+    )
+    global_origin = vector3_attribute(
+        hdf.attrs["origin"], dtype=float, attribute_name="origin"
+    )
 
     component_count = int(group.attrs["num_components"])
     component_names = [
