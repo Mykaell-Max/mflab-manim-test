@@ -492,18 +492,24 @@ def fluid_distance(grid) -> np.ndarray | None:
     return -distance
 
 
-def masked_q(grid, jacobian) -> np.ndarray:
-    """Q com a vizinhança do sólido zerada."""
-    q = q_criterion(jacobian)
-    distance = fluid_distance(grid)
-    if distance is None:
-        return q
+def masked_q(grid, jacobian):
+    """Q com a vizinhança do sólido zerada.
 
-    band = Q_MASK_CELLS * TARGET_DX
-    # NaN em dwall_s vem do sentinela 1e40, ou seja, longe da parede.
-    solid = np.isfinite(distance) & (distance < band)
-    q[as_block(solid, q.shape)] = 0.0
-    return q
+    Devolve também o máximo antes da máscara: comparar os dois valores
+    distingue um campo genuinamente sem vórtices de uma máscara larga
+    demais, que são falhas completamente diferentes.
+    """
+    q = q_criterion(jacobian)
+    raw_maximum = float(q.max())
+
+    distance = fluid_distance(grid)
+    if distance is not None:
+        band = Q_MASK_CELLS * TARGET_DX
+        # NaN em dwall_s vem do sentinela 1e40, ou seja, longe da parede.
+        solid = np.isfinite(distance) & (distance < band)
+        q[as_block(solid, q.shape)] = 0.0
+
+    return q, raw_maximum, float(q.max())
 
 
 # -----------------------------------------------------------------------------
@@ -692,9 +698,10 @@ def build_scene(cache_files: list[Path], force: bool = False):
                 destination / f"streamlines.{step:09d}.vtp", binary=True
             )
 
+        q_report = ""
         if WAKE_MODE == "q":
             jacobian = velocity_jacobian(grid)
-            block = masked_q(grid, jacobian)
+            block, raw_maximum, masked_maximum = masked_q(grid, jacobian)
             del jacobian
             q_blocks[step] = block
 
@@ -704,36 +711,53 @@ def build_scene(cache_files: list[Path], force: bool = False):
                 q_samples.append(
                     generator.choice(positive, sample_size, replace=False)
                 )
+            q_report = (
+                f" • Q max {masked_maximum:.4g} "
+                f"(bruto {raw_maximum:.4g}, {positive.size:,} pts > 0)"
+            )
 
         elapsed = time.perf_counter() - started
         tube_points = tubes.n_points if tubes is not None else 0
         print(
             f"[{index:02d}/{len(cache_files):02d}] ct.{step:09d} • "
-            f"corte {section.n_points:,} • tubos {tube_points:,} • "
-            f"{elapsed:.1f} s",
+            f"corte {section.n_points:,} • tubos {tube_points:,}"
+            f"{q_report} • {elapsed:.1f} s",
             flush=True,
         )
 
     if WAKE_MODE == "q":
-        if not q_samples:
-            raise ValueError(
-                "Nenhum valor positivo de Q encontrado. O campo de "
-                "velocidade ou a máscara do sólido estão incorretos."
+        if q_samples:
+            pooled = np.concatenate(q_samples)
+            wake_level = float(np.percentile(pooled, Q_PERCENTILE))
+            scale = 1.0 if radius is None else (1.0 / (2.0 * radius)) ** 2
+            print(
+                f"Limiar global de Q: {wake_level:.4g} "
+                f"(percentil {Q_PERCENTILE}) • Q* = Q/(U/D)² = "
+                f"{wake_level / scale:.4g}"
             )
-        pooled = np.concatenate(q_samples)
-        wake_level = float(np.percentile(pooled, Q_PERCENTILE))
-        scale = 1.0 if radius is None else (1.0 / (2.0 * radius)) ** 2
-        print(
-            f"Limiar global de Q: {wake_level:.4g} "
-            f"(percentil {Q_PERCENTILE}) • Q* = Q/(U/D)² = "
-            f"{wake_level / scale:.4g}"
-        )
+        else:
+            # Campo uniforme (tipicamente a condição inicial) produz Q = 0
+            # em todo o domínio. É o resultado correto, não uma falha:
+            # não existe vórtice em t = 0.
+            wake_level = None
+            print(
+                "Nenhum valor positivo de Q em nenhum frame. Se estes são "
+                "só os primeiros timesteps, isso é esperado; a cena fica "
+                "sem superfície de vórtice. Se timesteps desenvolvidos "
+                "também derem zero, compare 'Q max' com 'bruto' acima: "
+                "iguais e nulos indicam campo sem vorticidade, bruto alto "
+                "com máscara nula indica Q_MASK_CELLS larga demais."
+            )
     else:
         wake_level = WAKE_SPEED
         print(f"Isosuperfície global de |u|: {wake_level:.4f}")
 
     for index, path in enumerate(cache_files, start=1):
         step = timestep_number(path)
+
+        if wake_level is None:
+            q_blocks.clear()
+            break
 
         if WAKE_MODE == "q":
             block = q_blocks.pop(step)
@@ -965,10 +989,13 @@ def view(metadata):
         color=TEXT_COLOR,
     )
 
-    if metadata["wake_mode"] == "q":
-        wake_label = f"esteira: Q = {metadata['wake_level']:.4g}"
+    level = metadata["wake_level"]
+    if level is None:
+        wake_label = "esteira: sem estrutura no intervalo processado"
+    elif metadata["wake_mode"] == "q":
+        wake_label = f"esteira: Q = {level:.4g}"
     else:
-        wake_label = f"esteira: |u| = {metadata['wake_level']:.2f}"
+        wake_label = f"esteira: |u| = {level:.2f}"
     plotter.add_text(
         f"dx = {metadata['target_dx']:g} • {wake_label} • projeção paralela",
         position="lower_right",
@@ -1099,6 +1126,12 @@ def main():
         help="processa apenas os N primeiros timesteps",
     )
     parser.add_argument(
+        "--steps",
+        type=int,
+        nargs="+",
+        help="processa apenas estes timesteps (ex.: --steps 1000 1200)",
+    )
+    parser.add_argument(
         "--wake",
         choices=("q", "speed"),
         help="tipo de isosuperfície da esteira (padrão: q)",
@@ -1123,17 +1156,23 @@ def main():
 
     print(f"Dados: {OUTPUT_DIR}")
 
-    if run_preprocess:
-        files = discover_hdf5_files()
+    def select(files: list[Path]) -> list[Path]:
+        if args.steps:
+            wanted = set(args.steps)
+            files = [f for f in files if timestep_number(f) in wanted]
+            if not files:
+                raise FileNotFoundError(
+                    f"Nenhum timestep encontrado entre {sorted(wanted)}."
+                )
         if args.frames:
             files = files[: args.frames]
-        preprocess(files, force=args.force)
+        return files
+
+    if run_preprocess:
+        preprocess(select(discover_hdf5_files()), force=args.force)
 
     if run_geometry:
-        files = discover_cache_files()
-        if args.frames:
-            files = files[: args.frames]
-        build_scene(files, force=args.force)
+        build_scene(select(discover_cache_files()), force=args.force)
 
     if run_view:
         view(load_scene())
