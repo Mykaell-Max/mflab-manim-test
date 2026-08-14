@@ -1949,8 +1949,27 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
     total_frames = (
         1 if preview is not None else int(VIDEO_FPS * VIDEO_SECONDS)
     )
-    time_span = float(times[-1] - times[0]) if len(times) > 1 else 1.0
-    dt = time_span / max(total_frames - 1, 1)
+    video_frames = int(VIDEO_FPS * VIDEO_SECONDS)
+
+    # Com um único timestep o campo é tratado como congelado, o que a
+    # Re ~ 100 é fisicamente correto: a esteira é estacionária e todo o
+    # movimento do vídeo vem das partículas. O que não se pode fazer é
+    # inventar tempo físico que não existe no dado.
+    steady = len(times) < 2
+    if steady:
+        time_span = 0.0
+        dt = VIDEO_SECONDS / max(video_frames - 1, 1)
+        print(
+            f"  UM timestep no cache: campo tratado como estacionário. "
+            f"dt = {dt:.5f} por frame, advecção sobre t = {times[0]:.5f}."
+        )
+        print(
+            "  Para animar também a formação da esteira, rode "
+            "--preprocess sem --steps nesta resolução."
+        )
+    else:
+        time_span = float(times[-1] - times[0])
+        dt = time_span / max(video_frames - 1, 1)
 
     generator = np.random.default_rng(7)
     positions = np.column_stack(
@@ -2051,14 +2070,24 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
     started = time.perf_counter()
     for frame in range(total_frames):
         index = preview if preview is not None else frame
-        fraction = index / max(int(VIDEO_FPS * VIDEO_SECONDS) - 1, 1)
+        fraction = index / max(video_frames - 1, 1)
         physical = float(times[0]) + fraction * time_span
 
-        upper = int(np.searchsorted(times, physical, side="right"))
-        upper = min(max(upper, 1), len(times) - 1)
-        lower = upper - 1
-        gap = float(times[upper] - times[lower])
-        blend = 0.0 if gap <= 0 else (physical - times[lower]) / gap
+        if steady:
+            lower = upper = 0
+            blend = 0.0
+        else:
+            # Sem o clamp inferior, um único timestep produzia lower = -1.
+            upper = int(
+                np.clip(
+                    np.searchsorted(times, physical, side="right"),
+                    1,
+                    len(times) - 1,
+                )
+            )
+            lower = upper - 1
+            gap = float(times[upper] - times[lower])
+            blend = 0.0 if gap <= 0 else (physical - times[lower]) / gap
 
         def sampler(points, lower=lower, upper=upper, blend=blend):
             low = sample_vectors(fields[lower], origin, spacing, points)
@@ -2083,8 +2112,17 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
         speed_history = np.roll(speed_history, 1, axis=0)
         speed_history[0] = np.linalg.norm(velocity, axis=1)
 
-        tracers.points = history.reshape(-1, 3)
-        tracers.point_data["speed"] = speed_history.ravel()
+        # np.roll devolve arrays novos, então o VTK precisa ser avisado
+        # explicitamente de que os dados mudaram; sem isso ele pode
+        # reaproveitar o buffer anterior e todos os frames saem iguais.
+        tracers.points = np.ascontiguousarray(
+            history.reshape(-1, 3), dtype=np.float32
+        )
+        tracers.point_data["speed"] = np.ascontiguousarray(
+            speed_history.ravel(), dtype=np.float32
+        )
+        tracers.Modified()
+        tracer_actor.mapper.Modified()
 
         nearest = int(np.argmin(np.abs(times - physical)))
         wake_actor.mapper.SetInputData(
@@ -2109,7 +2147,10 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
             )
             if LIC_FLIP_V:
                 image = image[::-1]
-            plane_actor.SetTexture(pv.Texture(image))
+            texture = pv.Texture(np.ascontiguousarray(image))
+            texture.Modified()
+            plane_actor.SetTexture(texture)
+            plane_actor.Modified()
 
         angle = CAMERA_ORBIT_DEGREES * (fraction - 0.5)
         radians = np.radians(angle)
@@ -2129,6 +2170,7 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
         plotter.reset_camera_clipping_range()
 
         output = destination / f"frame_{index:05d}.png"
+        plotter.render()
         plotter.screenshot(str(output))
 
         if frame % 30 == 0 or frame == total_frames - 1:
