@@ -155,8 +155,14 @@ SHOW_VOLUME = True
 # |u| direto encheria o domínio inteiro de névoa opaca.
 VOLUME_DEFICIT_FLOOR = 0.03
 VOLUME_DEFICIT_FULL = 0.55
-VOLUME_MAX_OPACITY = 0.22
 VOLUME_GAMMA = 1.35
+# Opacidade POR CÉLULA atravessada, não por unidade de mundo. O VTK usa
+# ScalarOpacityUnitDistance = 1.0 por padrão; num domínio de 0.5 de largura
+# isso faz um raio cruzar a esteira inteira acumulando ~2% de opacidade, e o
+# volume some. Amarrar a unidade ao dx torna o valor previsível: atravessar
+# N células acumula 1 - (1 - opacidade)^N.
+VOLUME_MAX_OPACITY = 0.06
+VOLUME_UNIT_CELLS = 1.0
 
 # Suavização casada ao nível AMR: cada região é borrada até o dx nativo do
 # nível que prevaleceu ali. Não é maquiagem — é remover detalhe que a
@@ -2189,7 +2195,7 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
             origin=tuple(float(value) for value in origin),
         )
         volume_grid.point_data["speed"] = speeds[0].ravel(order="F")
-        plotter.add_volume(
+        volume_actor = plotter.add_volume(
             volume_grid,
             scalars="speed",
             cmap=COLORMAP,
@@ -2213,6 +2219,15 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
                 "height": 0.62,
                 "vertical": True,
             },
+        )
+
+        unit = VOLUME_UNIT_CELLS * float(spacing[0])
+        volume_actor.prop.SetScalarOpacityUnitDistance(unit)
+        crossing = 2.0 * diameter / unit
+        print(
+            f"  volume: opacidade {VOLUME_MAX_OPACITY:g} por "
+            f"{VOLUME_UNIT_CELLS:g} célula • atravessar 2 D da esteira "
+            f"acumula alfa {1.0 - (1.0 - VOLUME_MAX_OPACITY) ** crossing:.3f}"
         )
 
     tracers = pv.PolyData()
