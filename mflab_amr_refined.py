@@ -652,6 +652,54 @@ def vorticity_magnitude(jacobian) -> np.ndarray:
     )
 
 
+def recirculation_field(grid, center, radius):
+    """Campo cuja isosuperfície em 0 delimita a bolha de recirculação.
+
+    Abaixo de Re ~ 210 a esteira da esfera é estacionária e axissimétrica:
+    não há vórtice destacado para o Q-criterion encontrar, e a estrutura
+    característica é o toro de escoamento reverso colado atrás do corpo.
+
+    u = 0 também vale na parede (não escorregamento) e dentro do sólido,
+    então essas regiões recebem valor positivo: sem isso, a isosuperfície
+    envolveria a esfera inteira em vez da bolha.
+
+    Devolve o campo e o comprimento da bolha em diâmetros, que é uma
+    medida física comparável com a literatura — logo, uma validação do
+    pipeline inteiro, não só um número decorativo.
+    """
+    shape = grid_shape(grid)
+    streamwise = as_block(
+        np.asarray(grid.point_data["velocity"])[:, 0], shape
+    ).copy()
+
+    distance = fluid_distance(grid)
+    if distance is not None:
+        solid = np.isfinite(distance) & (distance < TARGET_DX)
+        streamwise[as_block(solid, shape)] = 1.0
+
+    if center is None or not radius:
+        return streamwise, None
+
+    origin = np.asarray(grid.origin)
+    spacing = float(grid.spacing[0])
+    coordinates = origin[0] + np.arange(shape[0]) * spacing
+
+    # Só a jusante do centro: a montante não há recirculação, e o contorno
+    # ali seria apenas a face frontal do corpo.
+    upstream = coordinates <= center[0]
+    streamwise[upstream, :, :] = 1.0
+
+    reverse = streamwise < 0.0
+    if not reverse.any():
+        return streamwise, None
+
+    columns = np.any(reverse, axis=(1, 2))
+    furthest = coordinates[np.nonzero(columns)[0][-1]]
+    # Medida a partir do polo traseiro da esfera, não do centro.
+    length = (furthest - (center[0] + radius)) / (2.0 * radius)
+    return streamwise, float(length)
+
+
 def masked_q(grid, jacobian, mask_distance: float):
     """Q com a faixa de espessura mask_distance junto ao sólido zerada.
 
@@ -892,7 +940,8 @@ def build_scene(cache_files: list[Path], force: bool = False):
 
     speed_minimum = np.inf
     speed_maximum = -np.inf
-    q_blocks: dict[int, np.ndarray] = {}
+    wake_blocks: dict[int, np.ndarray] = {}
+    bubble_lengths: dict[int, float | None] = {}
     q_star_maximum = 0.0
     q_star_counts = np.zeros(len(Q_STAR_REPORT), dtype=np.int64)
     vorticity_samples: list[np.ndarray] = []
@@ -937,7 +986,7 @@ def build_scene(cache_files: list[Path], force: bool = False):
             block, raw_maximum, masked_maximum = masked_q(
                 grid, jacobian, mask_distance
             )
-            q_blocks[step] = block
+            wake_blocks[step] = block
 
             for position, q_star in enumerate(Q_STAR_REPORT):
                 q_star_counts[position] += int(
@@ -949,6 +998,19 @@ def build_scene(cache_files: list[Path], force: bool = False):
                 f"(bruto {raw_maximum / q_scale:.3g}, "
                 f"{int((block > 0.0).sum()):,} pts > 0)"
             )
+        elif WAKE_MODE == "reverse":
+            block, length = recirculation_field(grid, center, radius)
+            wake_blocks[step] = block
+            bubble_lengths[step] = length
+            q_report = (
+                " • bolha L/D "
+                + ("indefinida" if length is None else f"{length:.3f}")
+            )
+        else:
+            wake_blocks[step] = as_block(
+                np.asarray(grid.point_data["velocity_magnitude"]),
+                grid_shape(grid),
+            ).copy()
 
         del jacobian, vorticity
         elapsed = time.perf_counter() - started
@@ -994,6 +1056,26 @@ def build_scene(cache_files: list[Path], force: bool = False):
                 f"  limiar: Q* = {Q_STAR_LEVEL:g} → Q = {wake_level:.4g} "
                 "(fixo entre todos os frames)"
             )
+    elif WAKE_MODE == "reverse":
+        wake_level = 0.0
+        measured = [
+            value for value in bubble_lengths.values() if value is not None
+        ]
+        if measured:
+            print(
+                f"Bolha de recirculação: L/D de {min(measured):.3f} a "
+                f"{max(measured):.3f} sobre os frames processados"
+            )
+            print(
+                "  para esfera a Re ~ 100 a literatura reporta L/D da ordem "
+                "de 0.8 a 1.0; confira contra a sua referência antes de "
+                "publicar o número"
+            )
+        else:
+            print(
+                "Nenhum escoamento reverso encontrado: sem bolha de "
+                "recirculação neste intervalo."
+            )
     else:
         wake_level = WAKE_SPEED
         print(f"Isosuperfície global de |u|: {wake_level:.4f}")
@@ -1002,33 +1084,24 @@ def build_scene(cache_files: list[Path], force: bool = False):
         step = timestep_number(path)
 
         if wake_level is None:
-            q_blocks.clear()
+            wake_blocks.clear()
             break
 
-        if WAKE_MODE == "q":
-            block = q_blocks.pop(step)
-            source = pv.ImageData(
-                dimensions=block.shape,
-                spacing=reference.spacing,
-                origin=reference.origin,
-            )
-            source.point_data["q"] = block.ravel(order="F")
-            surface = source.contour(
-                [wake_level],
-                scalars="q",
-                method="flying_edges",
-                compute_normals=True,
-            )
-        else:
-            grid = pv.read(path)
-            surface = contour_scalar(
-                grid,
-                "velocity_magnitude",
-                np.asarray(grid.point_data["velocity_magnitude"]),
-                wake_level,
-            )
-            if surface is None:
-                surface = pv.PolyData()
+        # Todos os modos passam pelo mesmo caminho: o campo já está pronto
+        # em wake_blocks e só falta cortá-lo no nível global.
+        block = wake_blocks.pop(step)
+        source = pv.ImageData(
+            dimensions=block.shape,
+            spacing=reference.spacing,
+            origin=reference.origin,
+        )
+        source.point_data["wake"] = block.ravel(order="F")
+        surface = source.contour(
+            [wake_level],
+            scalars="wake",
+            method="flying_edges",
+            compute_normals=True,
+        )
 
         if surface.n_points:
             surface.save(destination / f"wake.{step:09d}.vtp", binary=True)
@@ -1456,6 +1529,8 @@ def view(metadata):
             f"faixa de {metadata['q_mask_diameters']:g} D junto à parede "
             "excluída"
         )
+    elif metadata["wake_mode"] == "reverse":
+        wake_label = "bolha de recirculação: superfície u = 0"
     else:
         wake_label = f"esteira: |u| = {level:.2f}"
     plotter.add_text(
@@ -1619,8 +1694,13 @@ def main():
     )
     parser.add_argument(
         "--wake",
-        choices=("q", "speed"),
-        help="tipo de isosuperfície da esteira (padrão: q)",
+        choices=("q", "reverse", "speed"),
+        help=(
+            "estrutura da esteira: q = Q-criterion (escoamento com "
+            "desprendimento), reverse = bolha de recirculação (esteira "
+            f"estacionária), speed = isosuperfície de |u| (padrão: "
+            f"{WAKE_MODE})"
+        ),
     )
     parser.add_argument(
         "--q-star",
