@@ -39,6 +39,10 @@ OUTPUT_DIR = Path("/home/max/Downloads/output")
 # 0.002: preserva o dx mais fino no domínio inteiro (~34 milhões/frame).
 TARGET_DX = 0.004
 
+# vec_dx do level_0 neste caso. Usado só no relatório de --inspect, para
+# traduzir amr_level em dx nativo; não entra em nenhum cálculo.
+BASE_LEVEL_DX = 0.032
+
 CACHE_DIR_NAME = "mflab_amr_cache"
 CACHE_FLOAT_TYPE = np.float32
 COMPONENTS_TO_CACHE = ("u", "v", "w", "pressure", "dwall_s")
@@ -843,6 +847,117 @@ def build_scene(cache_files: list[Path], force: bool = False):
 # Visualização
 # -----------------------------------------------------------------------------
 
+def axis_extent(mask_block, origin, spacing, axis):
+    """Extensão física ocupada por uma máscara ao longo de um eixo."""
+    others = tuple(other for other in range(3) if other != axis)
+    present = np.any(mask_block, axis=others)
+    if not present.any():
+        return None
+    low = int(np.argmax(present))
+    high = len(present) - 1 - int(np.argmax(present[::-1]))
+    return origin[axis] + low * spacing, origin[axis] + high * spacing
+
+
+def inspect_cache(cache_files: list[Path]):
+    """Valida a reconstrução AMR antes de confiar em qualquer imagem.
+
+    Responde: a cobertura é completa? onde cada nível prevaleceu? qual a
+    resolução efetiva dentro da esteira? Sem isso, uma cena plausível pode
+    estar associando células ao nível errado.
+    """
+    reference = pv.read(cache_files[len(cache_files) // 2])
+    center, radius = sphere_geometry(sphere_surface(reference))
+    if center is not None:
+        print(
+            f"Esfera: centro {np.round(center, 4)} • "
+            f"D = {2.0 * radius:.4f} • {2.0 * radius / TARGET_DX:.1f} "
+            "células no diâmetro"
+        )
+
+    for path in cache_files:
+        grid = pv.read(path)
+        shape = grid_shape(grid)
+        origin = np.asarray(grid.origin)
+        spacing = float(grid.spacing[0])
+
+        print(f"\n=== {path.name} • t = {physical_time(grid):.6f}")
+        print(
+            f"  grade {shape[0]}x{shape[1]}x{shape[2]} = "
+            f"{grid.n_points:,} pontos • dx = {spacing:g}"
+        )
+        print(f"  limites {np.round(grid.bounds, 4).tolist()}")
+
+        level = np.asarray(grid.point_data["amr_level"])
+        uncovered = int((level < 0).sum())
+        print(
+            f"  cobertura: {uncovered:,} pontos SEM NÍVEL"
+            if uncovered
+            else "  cobertura: completa"
+        )
+
+        print("  nível        pontos   fração  caixa física ocupada")
+        for value in np.unique(level):
+            selection = as_block(level == value, shape)
+            count = int(selection.sum())
+            extents = [
+                axis_extent(selection, origin, spacing, axis)
+                for axis in range(3)
+            ]
+            box = " ".join(
+                "-" if e is None else f"[{e[0]:.3f},{e[1]:.3f}]"
+                for e in extents
+            )
+            print(
+                f"  {value:>5}  {count:>12,}  {count / level.size:>6.2%}  "
+                f"{box}"
+            )
+
+        velocity = np.asarray(grid.point_data["velocity"])
+        for name, values in (
+            ("u", velocity[:, 0]),
+            ("v", velocity[:, 1]),
+            ("w", velocity[:, 2]),
+            ("|u|", np.asarray(grid.point_data["velocity_magnitude"])),
+            ("pressure", np.asarray(grid.point_data["pressure"])),
+            ("dwall_s", np.asarray(grid.point_data["dwall_s"])),
+        ):
+            finite = values[np.isfinite(values)]
+            nan_count = int(np.isnan(values).sum())
+            suffix = f" • {nan_count:,} NaN" if nan_count else ""
+            print(
+                f"  {name:>9}: {finite.min():>12.6g} .. "
+                f"{finite.max():>12.6g}{suffix}"
+            )
+
+        if center is None:
+            continue
+
+        # Resolução efetiva onde a esteira realmente está.
+        coordinates = [
+            origin[axis] + np.arange(shape[axis]) * spacing
+            for axis in range(3)
+        ]
+        downstream = coordinates[0] > center[0] + radius
+        radial = np.hypot(
+            (coordinates[1] - center[1])[:, None],
+            (coordinates[2] - center[2])[None, :],
+        )
+        wake = downstream[:, None, None] & (radial < 2.0 * radius)[None]
+        wake_levels = as_block(level, shape)[wake]
+
+        if wake_levels.size:
+            print(
+                f"  esteira (x > {center[0] + radius:.3f}, r < "
+                f"{2.0 * radius:.3f}): {wake_levels.size:,} pontos"
+            )
+            for value in np.unique(wake_levels):
+                share = int((wake_levels == value).sum()) / wake_levels.size
+                print(
+                    f"    nível {value}: {share:>6.2%} • "
+                    f"dx nativo {BASE_LEVEL_DX / 2 ** int(value):g}"
+                )
+
+
 def discover_cache_files() -> list[Path]:
     files = sorted(cache_directory().glob("ct.*.vti"))
     if not files:
@@ -1140,6 +1255,11 @@ def main():
         help=".vti -> geometria da cena (.vtp)",
     )
     parser.add_argument(
+        "--inspect",
+        action="store_true",
+        help="relatório de validação da reconstrução AMR",
+    )
+    parser.add_argument(
         "--view",
         action="store_true",
         help="anima a geometria já calculada",
@@ -1192,7 +1312,9 @@ def main():
     if args.mask_cells is not None:
         Q_MASK_CELLS = args.mask_cells
 
-    selected = args.preprocess or args.geometry or args.view
+    selected = (
+        args.preprocess or args.geometry or args.view or args.inspect
+    )
     run_preprocess = args.preprocess or not selected
     run_geometry = args.geometry or not selected
     run_view = args.view or not selected
@@ -1213,6 +1335,9 @@ def main():
 
     if run_preprocess:
         preprocess(select(discover_hdf5_files()), force=args.force)
+
+    if args.inspect:
+        inspect_cache(select(discover_cache_files()))
 
     if run_geometry:
         build_scene(select(discover_cache_files()), force=args.force)
