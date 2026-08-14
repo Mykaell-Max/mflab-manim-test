@@ -25,6 +25,7 @@ from pathlib import Path
 import h5py
 import numpy as np
 import pyvista as pv
+import vtk
 from scipy.ndimage import gaussian_filter, map_coordinates
 
 
@@ -163,6 +164,11 @@ VOLUME_GAMMA = 1.35
 # N células acumula 1 - (1 - opacidade)^N.
 VOLUME_MAX_OPACITY = 0.06
 VOLUME_UNIT_CELLS = 1.0
+# Colormap invertido de propósito. O que se exibe é a região LENTA; numa
+# escala convencional ela cai no extremo escuro e desaparece contra o fundo.
+# Invertida, o núcleo lento é o mais claro e o escoamento livre — que já é
+# transparente — seria o escuro. A barra de escala declara o sentido.
+VOLUME_COLORMAP = "magma_r"
 
 # Suavização casada ao nível AMR: cada região é borrada até o dx nativo do
 # nível que prevaleceu ali. Não é maquiagem — é remover detalhe que a
@@ -1935,7 +1941,23 @@ def volume_opacity_curve(scalar_range, samples=256):
         0.0,
         1.0,
     )
-    return (normalized ** VOLUME_GAMMA) * VOLUME_MAX_OPACITY
+    return values, (normalized ** VOLUME_GAMMA) * VOLUME_MAX_OPACITY
+
+
+def volume_opacity_function(scalar_range):
+    """Função de opacidade escalar em ponto flutuante.
+
+    Não usar o caminho de opacidade do PyVista aqui: ele quantiza o alfa em
+    uint8 dentro da tabela de cores, e opacidades pequenas — que é o regime
+    útil em volume rendering, porque o alfa se acumula ao longo do raio —
+    são arredondadas para zero. 0.06 virava 0, e o volume ficava
+    inteiramente transparente.
+    """
+    values, curve = volume_opacity_curve(scalar_range)
+    function = vtk.vtkPiecewiseFunction()
+    for value, alpha in zip(values, curve):
+        function.AddPoint(float(value), float(alpha))
+    return function
 
 
 def video_directory() -> Path:
@@ -2198,13 +2220,16 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
         volume_actor = plotter.add_volume(
             volume_grid,
             scalars="speed",
-            cmap=COLORMAP,
+            cmap=VOLUME_COLORMAP,
             clim=metadata["speed_range"],
-            opacity=volume_opacity_curve(metadata["speed_range"]),
-            shade=True,
-            ambient=0.35,
-            diffuse=0.80,
-            specular=0.15,
+            # Emissivo: sem iluminação, a cor de cada voxel é exatamente a
+            # da função de transferência aplicada a |u|. Além de muito mais
+            # legível sobre fundo escuro, evita que posição de luz altere a
+            # aparência de um campo escalar.
+            shade=False,
+            ambient=1.0,
+            diffuse=0.0,
+            specular=0.0,
             mapper="smart",
             reset_camera=False,
             show_scalar_bar=True,
@@ -2222,12 +2247,21 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
         )
 
         unit = VOLUME_UNIT_CELLS * float(spacing[0])
+        opacity_function = volume_opacity_function(metadata["speed_range"])
+        volume_actor.prop.SetScalarOpacity(opacity_function)
         volume_actor.prop.SetScalarOpacityUnitDistance(unit)
         crossing = 2.0 * diameter / unit
         print(
             f"  volume: opacidade {VOLUME_MAX_OPACITY:g} por "
             f"{VOLUME_UNIT_CELLS:g} célula • atravessar 2 D da esteira "
             f"acumula alfa {1.0 - (1.0 - VOLUME_MAX_OPACITY) ** crossing:.3f}"
+        )
+        print(
+            "  opacidade conferida: "
+            + " ".join(
+                f"|u|={probe:.2f}->{opacity_function.GetValue(probe):.4f}"
+                for probe in (0.0, 0.5, 0.9, 1.0)
+            )
         )
 
     tracers = pv.PolyData()
@@ -2281,6 +2315,8 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
         f"{metadata['speed_range'][1]:.4f}",
         "opacidade do volume proporcional ao deficit 1 - |u|/U "
         f"(nulo acima de |u| = {(1.0 - VOLUME_DEFICIT_FLOOR):.2f})",
+        "escala invertida: MAIS CLARO = escoamento MAIS LENTO",
+        "volume emissivo, sem iluminacao: a cor e o valor de |u|",
     ]
     if metadata.get("wake_mode") == "reverse":
         notes.append("superficie ciano: bolha de recirculacao, u = 0")
