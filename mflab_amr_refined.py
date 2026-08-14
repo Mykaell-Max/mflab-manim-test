@@ -127,10 +127,19 @@ VIDEO_FPS = 60
 VIDEO_SECONDS = 20.0
 VIDEO_SIZE = (1920, 1080)
 
-PARTICLE_COUNT = 24_000
-PARTICLE_TRAIL = 7  # posições passadas desenhadas como rastro
-PARTICLE_LIFETIME_SECONDS = 6.0
-PARTICLE_SIZE = 3.0
+# Rastro longo e população moderada: pontos curtos e numerosos lêem como
+# ruído, não como escoamento. O que dá sensação de fluido é o risco.
+PARTICLE_COUNT = 9_000
+PARTICLE_TRAIL = 28
+PARTICLE_LIFETIME_SECONDS = 7.0
+PARTICLE_WIDTH = 1.6
+# Segundos de vídeo que uma partícula do escoamento livre leva para
+# atravessar a largura enquadrada. É isto que fixa o dt da advecção quando
+# o campo é estacionário — não o tempo físico, que ali não avança.
+PARTICLE_TRANSIT_SECONDS = 7.0
+# Raio de semeadura em diâmetros, medido do eixo. Semear a seção inteira
+# enche o quadro de partículas em região onde o escoamento é uniforme.
+PARTICLE_SEED_RADII = 2.2
 
 SHOW_LIC = True
 LIC_WIDTH = 1024
@@ -1385,15 +1394,24 @@ def advect_rk4(positions, sampler, dt):
     return positions + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
 
 
-def spawn_positions(count, bounds, generator, inlet_fraction=0.02):
-    """Semeia na face de entrada, distribuído pela seção transversal."""
+def spawn_positions(
+    count, bounds, generator, center, radius, spread=None, inlet=0.02
+):
+    """Semeia num disco a montante, concentrado em torno do eixo.
+
+    sqrt na amostragem radial mantém a densidade uniforme por área; sem
+    ele as partículas se acumulam no centro do disco.
+    """
     xmin, xmax, ymin, ymax, zmin, zmax = bounds
-    span = xmax - xmin
+    limit = radius if spread is None else spread
+
+    angle = generator.uniform(0.0, 2.0 * np.pi, count)
+    distance = limit * np.sqrt(generator.uniform(0.0, 1.0, count))
     return np.column_stack(
         [
-            generator.uniform(xmin, xmin + inlet_fraction * span, count),
-            generator.uniform(ymin, ymax, count),
-            generator.uniform(zmin, zmax, count),
+            generator.uniform(xmin, xmin + inlet * (xmax - xmin), count),
+            np.clip(center[1] + distance * np.cos(angle), ymin, ymax),
+            np.clip(center[2] + distance * np.sin(angle), zmin, zmax),
         ]
     ).astype(np.float32)
 
@@ -1946,22 +1964,28 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
         print("Pré-calculando LIC (uma vez por timestep de dado)...")
         lic_data = prepare_lic(fields, spacing, slice_index, LIC_WIDTH)
 
-    total_frames = (
-        1 if preview is not None else int(VIDEO_FPS * VIDEO_SECONDS)
-    )
     video_frames = int(VIDEO_FPS * VIDEO_SECONDS)
+    # O preview precisa advectar até o frame pedido, não só desenhá-lo: as
+    # partículas do frame 600 só estão onde estão por causa dos 600 passos
+    # anteriores. Renderizar sem integrar mostraria a semeadura inicial.
+    total_frames = video_frames if preview is None else preview + 1
 
     # Com um único timestep o campo é tratado como congelado, o que a
     # Re ~ 100 é fisicamente correto: a esteira é estacionária e todo o
     # movimento do vídeo vem das partículas. O que não se pode fazer é
     # inventar tempo físico que não existe no dado.
     steady = len(times) < 2
+    framed_width = CAMERA_FRAME_DIAMETERS * (VIDEO_SIZE[0] / VIDEO_SIZE[1])
+    transit_dt = (framed_width * diameter / REFERENCE_VELOCITY) / (
+        PARTICLE_TRANSIT_SECONDS * VIDEO_FPS
+    )
+
     if steady:
         time_span = 0.0
-        dt = VIDEO_SECONDS / max(video_frames - 1, 1)
+        dt = transit_dt
         print(
-            f"  UM timestep no cache: campo tratado como estacionário. "
-            f"dt = {dt:.5f} por frame, advecção sobre t = {times[0]:.5f}."
+            f"  UM timestep no cache: campo tratado como estacionário, "
+            f"t = {times[0]:.5f} fixo. Todo o movimento vem das partículas."
         )
         print(
             "  Para animar também a formação da esteira, rode "
@@ -1971,16 +1995,23 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
         time_span = float(times[-1] - times[0])
         dt = time_span / max(video_frames - 1, 1)
 
+    print(
+        f"  dt = {dt:.3e} por frame • {dt / float(spacing[0]):.2f} células "
+        f"por frame no escoamento livre • travessia do quadro em "
+        f"{framed_width * diameter / (dt * VIDEO_FPS):.1f} s de vídeo"
+    )
+
     generator = np.random.default_rng(7)
-    positions = np.column_stack(
-        [
-            generator.uniform(bounds[0], bounds[1], PARTICLE_COUNT),
-            generator.uniform(bounds[2], bounds[3], PARTICLE_COUNT),
-            generator.uniform(bounds[4], bounds[5], PARTICLE_COUNT),
-        ]
-    ).astype(np.float32)
+    seed_radius = PARTICLE_SEED_RADII * diameter
+    lifetime_frames = PARTICLE_LIFETIME_SECONDS * VIDEO_FPS
+
+    # População inicial espalhada por todo o comprimento, senão o vídeo
+    # começa com o quadro vazio e as partículas entrando em bloco.
+    positions = spawn_positions(
+        PARTICLE_COUNT, bounds, generator, center, seed_radius, inlet=1.0
+    )
     ages = generator.uniform(
-        0.0, PARTICLE_LIFETIME_SECONDS, PARTICLE_COUNT
+        0.0, lifetime_frames, PARTICLE_COUNT
     ).astype(np.float32)
     history = np.repeat(positions[None], PARTICLE_TRAIL, axis=0)
     speed_history = np.zeros(
@@ -2025,7 +2056,7 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
             scene_directory() / f"wake.{timestep_number(cache_files[0]):09d}.vtp"
         ),
         color=WAKE_COLOR,
-        opacity=0.45,
+        opacity=0.80,
         smooth_shading=True,
         specular=0.25,
         show_scalar_bar=False,
@@ -2041,7 +2072,7 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
         scalars="speed",
         cmap=COLORMAP,
         clim=metadata["speed_range"],
-        line_width=PARTICLE_SIZE * 0.5,
+        line_width=PARTICLE_WIDTH,
         opacity=0.85,
         lighting=False,
         show_scalar_bar=False,
@@ -2067,9 +2098,11 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
         bounds[1] - bounds[0]
     )
 
+    current_wake = 0
     started = time.perf_counter()
     for frame in range(total_frames):
-        index = preview if preview is not None else frame
+        index = frame
+        capture = preview is None or frame == preview
         fraction = index / max(video_frames - 1, 1)
         physical = float(times[0]) + fraction * time_span
 
@@ -2095,11 +2128,17 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
             return (1.0 - blend) * low + blend * high
 
         positions = advect_rk4(positions, sampler, dt)
-        ages += dt
+        ages += 1.0
 
-        dead = expired(positions, ages, bounds, PARTICLE_LIFETIME_SECONDS)
+        dead = expired(positions, ages, bounds, lifetime_frames)
         if dead.any():
-            fresh = spawn_positions(int(dead.sum()), bounds, generator)
+            fresh = spawn_positions(
+                int(dead.sum()),
+                bounds,
+                generator,
+                center,
+                seed_radius,
+            )
             positions[dead] = fresh
             ages[dead] = 0.0
             # Rastro inteiro reposicionado: senão a partícula renascida
@@ -2124,14 +2163,24 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
         tracers.Modified()
         tracer_actor.mapper.Modified()
 
+        if not capture:
+            # Só a advecção precisa rodar em todos os passos; ler a esteira
+            # do disco, montar a textura e gravar o PNG são exclusivos do
+            # frame que será de fato capturado.
+            if frame % 100 == 0:
+                print(f"  advectando até {preview}: {frame}", flush=True)
+            continue
+
         nearest = int(np.argmin(np.abs(times - physical)))
-        wake_actor.mapper.SetInputData(
-            read_optional(
-                scene_directory()
-                / f"wake.{timestep_number(cache_files[nearest]):09d}.vtp"
+        if nearest != current_wake:
+            wake_actor.mapper.SetInputData(
+                read_optional(
+                    scene_directory()
+                    / f"wake.{timestep_number(cache_files[nearest]):09d}.vtp"
+                )
             )
-        )
-        wake_actor.mapper.ScalarVisibilityOff()
+            wake_actor.mapper.ScalarVisibilityOff()
+            current_wake = nearest
 
         if SHOW_LIC and plane_actor is not None:
             samples, vorticities, height, width = lic_data
