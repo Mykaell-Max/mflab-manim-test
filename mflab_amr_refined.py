@@ -111,16 +111,21 @@ FRAME_DURATION_MS = 250
 # Levemente a montante e acima: a esteira se afasta para o fundo da imagem
 # em vez de ficar comprimida contra a esfera.
 CAMERA_DIRECTION = (-0.25, -1.00, 0.32)
-CAMERA_ZOOM = 1.00
+# Enquadramento em diâmetros de esfera, não no domínio inteiro: o recorte
+# tem 13 D de comprimento e o assunto ocupa uns poucos D, então enquadrar a
+# caixa toda deixa o objeto perdido no meio da tela.
+CAMERA_FRAME_DIAMETERS = 5.5
+CAMERA_FOCUS_OFFSET_D = 2.5
 WINDOW_SIZE = (1600, 900)
 ENABLE_SSAO = True
 
 BACKGROUND = "#07131F"
 TEXT_COLOR = "#F1F6F9"
-GEOMETRY_COLOR = "#8FA3B0"
-# Superfície de vórtice em tom frio e claro: contrasta com o corte quente
-# em magma e recebe bem a iluminação, que é o que dá volume à forma.
-WAKE_COLOR = "#CFE8F5"
+# Corpo sólido em cinza neutro e fosco; estrutura de vórtice em ciano
+# saturado. As duas precisam ser inconfundíveis: com tons próximos elas se
+# fundem numa massa só e o corpo parece deformado.
+GEOMETRY_COLOR = "#9AA6AE"
+WAKE_COLOR = "#37D6E8"
 COLORMAP = "viridis"
 
 
@@ -306,10 +311,11 @@ def target_geometry(hdf: h5py.File, region=None):
     return cropped_min, cropped_max, stop - start + 1
 
 
-def decode_level(hdf: h5py.File, level_index: int):
+def decode_level(hdf: h5py.File, level_index: int, components=None):
     group = hdf[f"level_{level_index}"]
     boxes = group["boxes"][:]
     raw = group["data:datatype=0"][:]
+    components = components or COMPONENTS_TO_CACHE
     spacing = vector3_attribute(
         group.attrs["vec_dx"], dtype=float, attribute_name="vec_dx"
     )
@@ -323,8 +329,7 @@ def decode_level(hdf: h5py.File, level_index: int):
         for index in range(component_count)
     ]
     component_indices = {
-        name: component_names.index(name)
-        for name in COMPONENTS_TO_CACHE
+        name: component_names.index(name) for name in components
     }
 
     cursor = 0
@@ -735,23 +740,6 @@ def fit_sphere(points):
     return center, radius, residual
 
 
-def sphere_geometry(surface):
-    """Centro e raio da esfera, usados para semear e enquadrar."""
-    if surface is None:
-        return None, None
-
-    xmin, xmax, ymin, ymax, zmin, zmax = surface.bounds
-    center = np.array(
-        [
-            0.5 * (xmin + xmax),
-            0.5 * (ymin + ymax),
-            0.5 * (zmin + zmax),
-        ]
-    )
-    radius = 0.5 * max(xmax - xmin, ymax - ymin, zmax - zmin)
-    return center, float(radius)
-
-
 def body_surface(contour):
     """Geometria do corpo imerso, com o ajuste esférico validado.
 
@@ -1100,6 +1088,54 @@ def axis_extent(mask_block, origin, spacing, axis):
     return origin[axis] + low * spacing, origin[axis] + high * spacing
 
 
+def report_flow_parameters(hdf5_path: Path, diameter: float):
+    """Reynolds a partir da viscosidade e densidade gravadas no arquivo.
+
+    O regime decide o que é possível visualizar. Para esfera: abaixo de
+    Re ~ 210 a esteira é estacionária e axissimétrica, sem desprendimento
+    nenhum; entre 210 e 270 fica estacionária com dois filamentos; só acima
+    de ~270 há desprendimento periódico de vórtices em grampo. Perseguir
+    uma rua de vórtices num escoamento estacionário é perseguir algo que
+    não existe no dado.
+    """
+    with h5py.File(hdf5_path, "r") as hdf:
+        blocks = decode_level(hdf, 0, components=("viscosity", "density"))
+
+    viscosity = np.concatenate(
+        [block["arrays"]["viscosity"].ravel() for block in blocks]
+    )
+    density = np.concatenate(
+        [block["arrays"]["density"].ravel() for block in blocks]
+    )
+
+    print(
+        f"  viscosity: {viscosity.min():.6g} .. {viscosity.max():.6g}"
+        f" • density: {density.min():.6g} .. {density.max():.6g}"
+    )
+
+    mu = float(np.median(viscosity))
+    rho = float(np.median(density))
+    if mu <= 0.0:
+        print("  viscosidade nula ou negativa; Reynolds indeterminado.")
+        return
+
+    # MFSim não declara aqui se 'viscosity' é dinâmica ou cinemática, e a
+    # diferença é um fator rho. Reporto as duas leituras em vez de eleger
+    # uma: com rho = 1 elas coincidem de qualquer forma.
+    print(
+        f"  Re = rho*U*D/mu  = {rho * REFERENCE_VELOCITY * diameter / mu:.1f}"
+        "   (se viscosity for dinâmica)"
+    )
+    print(
+        f"  Re = U*D/nu      = {REFERENCE_VELOCITY * diameter / mu:.1f}"
+        "   (se viscosity for cinemática)"
+    )
+    print(
+        "  referência esfera: Re < 210 estacionária axissimétrica • "
+        "210-270 estacionária bifilamentar • > 270 desprendimento periódico"
+    )
+
+
 def inspect_cache(cache_files: list[Path]):
     """Valida a reconstrução AMR antes de confiar em qualquer imagem.
 
@@ -1115,6 +1151,11 @@ def inspect_cache(cache_files: list[Path]):
             f"D = {2.0 * radius:.4f} • {2.0 * radius / TARGET_DX:.1f} "
             "células no diâmetro"
         )
+        source = OUTPUT_DIR / (
+            f"ns_output_ct.{timestep_number(cache_files[0]):09d}.hdf5"
+        )
+        if source.exists():
+            report_flow_parameters(source, 2.0 * radius)
 
     for path in cache_files:
         grid = pv.read(path)
@@ -1427,11 +1468,15 @@ def view(metadata):
         xlabel="x", ylabel="y", zlabel="z", color=TEXT_COLOR
     )
 
-    focus = (
-        np.asarray(metadata["sphere_center"])
-        if metadata["sphere_center"] is not None
-        else np.asarray(first["slice"].center)
-    )
+    diameter = 2.0 * (metadata["sphere_radius"] or 0.0)
+    if metadata["sphere_center"] is not None and diameter > 0.0:
+        # Foco deslocado a jusante: o assunto é a esfera mais a esteira
+        # próxima, não a esfera centralizada com esteira saindo do quadro.
+        focus = np.asarray(metadata["sphere_center"]) + np.array(
+            [CAMERA_FOCUS_OFFSET_D * diameter, 0.0, 0.0]
+        )
+    else:
+        focus = np.asarray(first["slice"].center)
     length = first["slice"].length
     # Atribuído campo a campo no objeto Camera. A forma em lista
     # [posição, foco, viewup] não estava aplicando o viewup, e a cena vinha
@@ -1443,8 +1488,12 @@ def view(metadata):
         for value in focus + np.asarray(CAMERA_DIRECTION) * length
     )
     camera.up = (0.0, 0.0, 1.0)
+    if diameter > 0.0:
+        # Em projeção paralela o enquadramento é parallel_scale, e vale
+        # metade da altura visível. zoom() sobre um ajuste automático não
+        # é reprodutível entre execuções; isto é.
+        camera.parallel_scale = 0.5 * CAMERA_FRAME_DIAMETERS * diameter
     plotter.reset_camera_clipping_range()
-    plotter.camera.zoom(CAMERA_ZOOM)
 
     state = {"index": 0, "paused": False}
 
