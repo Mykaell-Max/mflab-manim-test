@@ -78,12 +78,40 @@ def discover_hdf5_files() -> list[Path]:
 
 def target_geometry(hdf: h5py.File):
     root = hdf["level_0"]
-    domain = np.asarray(root.attrs["prob_domain"], dtype=int)
+    domain_attribute = root.attrs["prob_domain"]
+
+    # Dependendo da versão do h5py/HDF5, prob_domain pode chegar como
+    # um vetor de seis inteiros ou como um escalar de dtype estruturado.
+    field_names = getattr(domain_attribute.dtype, "names", None)
+    if field_names:
+        lo = np.array(
+            [
+                domain_attribute["lo_i"],
+                domain_attribute["lo_j"],
+                domain_attribute["lo_k"],
+            ],
+            dtype=int,
+        )
+        hi = np.array(
+            [
+                domain_attribute["hi_i"],
+                domain_attribute["hi_j"],
+                domain_attribute["hi_k"],
+            ],
+            dtype=int,
+        )
+    else:
+        domain = np.asarray(domain_attribute, dtype=int).reshape(-1)
+        if domain.size != 6:
+            raise ValueError(
+                "prob_domain deveria conter seis índices, mas contém "
+                f"{domain.size}: {domain_attribute!r}"
+            )
+        lo = domain[:3]
+        hi = domain[3:]
+
     coarse_dx = np.asarray(root.attrs["vec_dx"], dtype=float)
     origin = np.asarray(hdf.attrs["origin"], dtype=float)
-
-    lo = domain[:3]
-    hi = domain[3:]
     physical_min = origin + lo * coarse_dx
     physical_max = origin + (hi + 1) * coarse_dx
 
