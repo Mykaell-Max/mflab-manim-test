@@ -127,9 +127,14 @@ VIDEO_FPS = 60
 VIDEO_SECONDS = 20.0
 VIDEO_SIZE = (1920, 1080)
 
+# Partículas são elemento cosmético: ajudam a ler movimento, mas competem
+# com o campo de velocidade, que é a informação de engenharia. Desligadas
+# por padrão; ligue com --particles.
+SHOW_PARTICLES = False
+
 # Rastro longo e população moderada: pontos curtos e numerosos lêem como
 # ruído, não como escoamento. O que dá sensação de fluido é o risco.
-PARTICLE_COUNT = 9_000
+PARTICLE_COUNT = 2_500
 PARTICLE_TRAIL = 28
 PARTICLE_LIFETIME_SECONDS = 7.0
 PARTICLE_WIDTH = 1.6
@@ -978,6 +983,14 @@ def build_scene(cache_files: list[Path], force: bool = False):
     else:
         print("  corpo: não encontrado em dwall_s = 0")
 
+    reynolds = None
+    if radius:
+        source = OUTPUT_DIR / (
+            f"ns_output_ct.{timestep_number(cache_files[0]):09d}.hdf5"
+        )
+        if source.exists():
+            reynolds = report_flow_parameters(source, 2.0 * radius)
+
     slice_normal = (0.0, 1.0, 0.0)
     slice_origin = (
         tuple(center) if center is not None else reference.center
@@ -1184,6 +1197,7 @@ def build_scene(cache_files: list[Path], force: bool = False):
 
     metadata = {
         "target_dx": TARGET_DX,
+        "reynolds": reynolds,
         "slice_scalar": SLICE_SCALAR,
         "slice_range": slice_range,
         "q_mask_diameters": Q_MASK_DIAMETERS if WAKE_MODE == "q" else None,
@@ -1250,7 +1264,7 @@ def report_flow_parameters(hdf5_path: Path, diameter: float):
     rho = float(np.median(density))
     if mu <= 0.0:
         print("  viscosidade nula ou negativa; Reynolds indeterminado.")
-        return
+        return None
 
     # MFSim não declara aqui se 'viscosity' é dinâmica ou cinemática, e a
     # diferença é um fator rho. Reporto as duas leituras em vez de eleger
@@ -1267,6 +1281,7 @@ def report_flow_parameters(hdf5_path: Path, diameter: float):
         "  referência esfera: Re < 210 estacionária axissimétrica • "
         "210-270 estacionária bifilamentar • > 270 desprendimento periódico"
     )
+    return rho * REFERENCE_VELOCITY * diameter / mu
 
 
 def inspect_cache(cache_files: list[Path]):
@@ -2185,8 +2200,19 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
             diffuse=0.80,
             specular=0.15,
             mapper="smart",
-            show_scalar_bar=False,
             reset_camera=False,
+            show_scalar_bar=True,
+            scalar_bar_args={
+                "title": "|u|  [U = 1]",
+                "n_labels": 6,
+                "fmt": "%.3f",
+                "color": TEXT_COLOR,
+                "position_x": 0.90,
+                "position_y": 0.16,
+                "width": 0.030,
+                "height": 0.62,
+                "vertical": True,
+            },
         )
 
     tracers = pv.PolyData()
@@ -2199,11 +2225,12 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
         tracers,
         color=TRACER_COLOR,
         line_width=PARTICLE_WIDTH,
-        opacity=0.55,
+        opacity=0.40,
         lighting=False,
         show_scalar_bar=False,
         reset_camera=False,
     )
+    tracer_actor.SetVisibility(SHOW_PARTICLES)
 
     plane_actor = None
     if SHOW_LIC:
@@ -2216,6 +2243,45 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
         plotter.enable_anti_aliasing("ssaa")
     except Exception as error:  # noqa: BLE001 - depende do driver
         print(f"SSAA indisponível: {error}")
+
+    # Anotação: sem isto o vídeo é uma imagem bonita sem valor de engenharia.
+    # Tudo que altera a leitura do dado precisa estar declarado no quadro.
+    reynolds = metadata.get("reynolds")
+    plotter.add_text(
+        "MFLab / UFU • esfera imersa"
+        + (f" • Re = {reynolds:.0f}" if reynolds else ""),
+        position="upper_left",
+        font_size=16,
+        color=TEXT_COLOR,
+    )
+    video_time_actor = plotter.add_text(
+        "", position=(24, 24), font_size=13, color=TEXT_COLOR
+    )
+
+    notes = [
+        f"reconstrucao AMR uniforme dx = {metadata['target_dx']:g}"
+        f" ({diameter / metadata['target_dx']:.0f} celulas / D)",
+        f"escala |u| fixa em todos os frames: "
+        f"{metadata['speed_range'][0]:.4f} a "
+        f"{metadata['speed_range'][1]:.4f}",
+        "opacidade do volume proporcional ao deficit 1 - |u|/U "
+        f"(nulo acima de |u| = {(1.0 - VOLUME_DEFICIT_FLOOR):.2f})",
+    ]
+    if metadata.get("wake_mode") == "reverse":
+        notes.append("superficie ciano: bolha de recirculacao, u = 0")
+    if LEVEL_MATCHED_SMOOTHING:
+        notes.append(
+            "campo suavizado ate o dx nativo de cada nivel AMR "
+            "(remove detalhe criado por interpolacao)"
+        )
+    if SHOW_PARTICLES:
+        notes.append("tracadores: elemento ilustrativo, nao medida")
+    plotter.add_text(
+        "\n".join(notes),
+        position="lower_right",
+        font_size=9,
+        color=TEXT_COLOR,
+    )
 
     focus = center + np.array(
         [CAMERA_FOCUS_OFFSET_D * diameter, 0.0, 0.0], dtype=np.float32
@@ -2349,6 +2415,11 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
         camera.parallel_scale = 0.5 * CAMERA_FRAME_DIAMETERS * diameter
         plotter.reset_camera_clipping_range()
 
+        video_time_actor.SetInput(
+            f"t = {physical:.6f}   (t U / D = {physical / diameter:.1f})"
+            + ("   campo estacionario" if steady else "")
+        )
+
         output = destination / f"frame_{index:05d}.png"
         plotter.render()
         plotter.screenshot(str(output))
@@ -2389,6 +2460,7 @@ def main():
     global OUTPUT_DIR, TARGET_DX, WAKE_MODE, Q_STAR_LEVEL, Q_MASK_DIAMETERS
     global CROP_LEVEL, SHOW_STREAMLINES, SLICE_SCALAR, SPHERE_MODE
     global SHOW_LIC, VIDEO_SECONDS, SHOW_VOLUME, LEVEL_MATCHED_SMOOTHING
+    global SHOW_PARTICLES
 
     parser = argparse.ArgumentParser(
         description="Reconstrói AMR do MFSim e visualiza o escoamento."
@@ -2429,6 +2501,11 @@ def main():
         "--lic",
         action="store_true",
         help="liga o corte com textura LIC (plano; ruim sob rotação)",
+    )
+    parser.add_argument(
+        "--particles",
+        action="store_true",
+        help="liga os traçadores (cosméticos, não são medida)",
     )
     parser.add_argument(
         "--no-volume",
@@ -2533,6 +2610,8 @@ def main():
         SPHERE_MODE = args.sphere
     if args.lic:
         SHOW_LIC = True
+    if args.particles:
+        SHOW_PARTICLES = True
     if args.no_volume:
         SHOW_VOLUME = False
     if args.no_smoothing:
