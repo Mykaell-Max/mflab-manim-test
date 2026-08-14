@@ -70,29 +70,47 @@ Q_STAR_LEVEL = 0.10
 # Níveis apenas reportados, para escolher Q_STAR_LEVEL com dado na mão.
 Q_STAR_REPORT = (0.01, 0.02, 0.05, 0.10, 0.20, 0.50, 1.00)
 
-# Células mascaradas ao redor do sólido: a interface imersa produz gradientes
-# numéricos que virariam uma casca espúria. Manter o mais estreito possível —
-# a camada cisalhante junto à parede é física, e é onde a vorticidade nasce.
-Q_MASK_CELLS = 1.0
+# Faixa excluída ao redor do sólido, em diâmetros de esfera. Em unidades
+# físicas, não em células: assim o mesmo valor significa a mesma coisa em
+# qualquer resolução. A camada limite tem o Q mais alto de todo o campo; sem
+# excluí-la, a isosuperfície vira uma casca colada no corpo em vez de mostrar
+# a esteira. O que se remove aqui é físico, e a legenda registra isso.
+Q_MASK_DIAMETERS = 0.12
+
+# --- corte -------------------------------------------------------------------
+# |u| é um escalar ruim para o corte em escoamento externo: quase todo o
+# domínio está no escoamento livre, então o plano vira uma chapa de uma cor
+# só. A vorticidade é praticamente nula fora da esteira, então o corte
+# escurece até o fundo e só a esteira acende.
+SLICE_SCALAR = "vorticity_magnitude"  # ou "velocity_magnitude"
+SLICE_COLORMAP = "magma"
+SLICE_PERCENTILE = 99.5  # topo da escala do corte, global e fixo
+SLICE_SAMPLES_PER_FRAME = 200_000
 
 # --- streamlines -------------------------------------------------------------
-# Anéis concêntricos a montante da esfera, em múltiplos do raio.
-STREAMLINE_RINGS = (0.35, 0.80, 1.30, 1.90, 2.60)
-STREAMLINE_PER_RING = 14
-STREAMLINE_UPSTREAM_RADII = 4.0
-STREAMLINE_TUBE_FRACTION = 0.0030  # fração do comprimento do domínio
+# Poucas linhas, semeadas junto ao corpo. Anéis largos a montante produzem
+# retas paralelas que só ocluem a cena: a montante o escoamento é uniforme.
+SHOW_STREAMLINES = True
+STREAMLINE_RINGS = (0.55, 0.95, 1.40)
+STREAMLINE_PER_RING = 8
+STREAMLINE_UPSTREAM_RADII = 3.0
+STREAMLINE_TUBE_FRACTION = 0.0016  # fração do comprimento do domínio
 
 # --- animação e câmera -------------------------------------------------------
 FRAME_DURATION_MS = 250
-CAMERA_DIRECTION = (0.45, -1.00, 0.40)
-CAMERA_ZOOM = 1.35
+# Levemente a montante e acima: a esteira se afasta para o fundo da imagem
+# em vez de ficar comprimida contra a esfera.
+CAMERA_DIRECTION = (-0.25, -1.00, 0.32)
+CAMERA_ZOOM = 1.00
 WINDOW_SIZE = (1600, 900)
 ENABLE_SSAO = True
 
 BACKGROUND = "#07131F"
 TEXT_COLOR = "#F1F6F9"
-GEOMETRY_COLOR = "#D7E4EC"
-WAKE_COLOR = "#E8A33D"
+GEOMETRY_COLOR = "#8FA3B0"
+# Superfície de vórtice em tom frio e claro: contrasta com o corte quente
+# em magma e recebe bem a iluminação, que é o que dá volume à forma.
+WAKE_COLOR = "#CFE8F5"
 COLORMAP = "viridis"
 
 
@@ -609,8 +627,18 @@ def fluid_distance(grid) -> np.ndarray | None:
     return -distance
 
 
-def masked_q(grid, jacobian):
-    """Q com a vizinhança do sólido zerada.
+def vorticity_magnitude(jacobian) -> np.ndarray:
+    """|ω| = |∇ × u|, a partir do mesmo Jacobiano usado no Q."""
+    omega_x = jacobian[2][1] - jacobian[1][2]
+    omega_y = jacobian[0][2] - jacobian[2][0]
+    omega_z = jacobian[1][0] - jacobian[0][1]
+    return np.sqrt(
+        omega_x * omega_x + omega_y * omega_y + omega_z * omega_z
+    )
+
+
+def masked_q(grid, jacobian, mask_distance: float):
+    """Q com a faixa de espessura mask_distance junto ao sólido zerada.
 
     Devolve também o máximo antes da máscara: comparar os dois valores
     distingue um campo genuinamente sem vórtices de uma máscara larga
@@ -620,10 +648,9 @@ def masked_q(grid, jacobian):
     raw_maximum = float(q.max())
 
     distance = fluid_distance(grid)
-    if distance is not None:
-        band = Q_MASK_CELLS * TARGET_DX
+    if distance is not None and mask_distance > 0.0:
         # NaN em dwall_s vem do sentinela 1e40, ou seja, longe da parede.
-        solid = np.isfinite(distance) & (distance < band)
+        solid = np.isfinite(distance) & (distance < mask_distance)
         q[as_block(solid, q.shape)] = 0.0
 
     return q, raw_maximum, float(q.max())
@@ -739,6 +766,9 @@ def seed_points(grid, center, radius):
 
 
 def streamline_tubes(grid, center, radius):
+    if not SHOW_STREAMLINES:
+        return None
+
     xmin, xmax = grid.bounds[0], grid.bounds[1]
     points = seed_points(grid, center, radius)
     if not len(points):
@@ -794,12 +824,22 @@ def build_scene(cache_files: list[Path], force: bool = False):
         else (REFERENCE_VELOCITY / (2.0 * radius)) ** 2
     )
 
+    # Máscara em unidades físicas, para valer o mesmo em qualquer dx.
+    mask_distance = Q_MASK_DIAMETERS * 2.0 * (radius or 0.0)
+    if radius:
+        print(
+            f"  máscara junto ao sólido: {Q_MASK_DIAMETERS:g} D = "
+            f"{mask_distance:.4f} = {mask_distance / TARGET_DX:.1f} células"
+        )
+
     speed_minimum = np.inf
     speed_maximum = -np.inf
     q_blocks: dict[int, np.ndarray] = {}
     q_star_maximum = 0.0
     q_star_counts = np.zeros(len(Q_STAR_REPORT), dtype=np.int64)
+    vorticity_samples: list[np.ndarray] = []
     times: dict[int, float] = {}
+    generator = np.random.default_rng(0)
 
     for index, path in enumerate(cache_files, start=1):
         step = timestep_number(path)
@@ -813,6 +853,18 @@ def build_scene(cache_files: list[Path], force: bool = False):
 
         started = time.perf_counter()
 
+        # O Jacobiano serve tanto à vorticidade do corte quanto ao Q, então
+        # é calculado uma vez só, antes de fatiar.
+        jacobian = velocity_jacobian(grid)
+        vorticity = vorticity_magnitude(jacobian)
+        grid.point_data["vorticity_magnitude"] = vorticity.ravel(order="F")
+
+        flat = vorticity.ravel()
+        sample_size = min(SLICE_SAMPLES_PER_FRAME, flat.size)
+        vorticity_samples.append(
+            generator.choice(flat, sample_size, replace=False)
+        )
+
         section = grid.slice(normal=slice_normal, origin=slice_origin)
         section.save(destination / f"slice.{step:09d}.vtp", binary=True)
 
@@ -824,9 +876,9 @@ def build_scene(cache_files: list[Path], force: bool = False):
 
         q_report = ""
         if WAKE_MODE == "q":
-            jacobian = velocity_jacobian(grid)
-            block, raw_maximum, masked_maximum = masked_q(grid, jacobian)
-            del jacobian
+            block, raw_maximum, masked_maximum = masked_q(
+                grid, jacobian, mask_distance
+            )
             q_blocks[step] = block
 
             for position, q_star in enumerate(Q_STAR_REPORT):
@@ -840,6 +892,7 @@ def build_scene(cache_files: list[Path], force: bool = False):
                 f"{int((block > 0.0).sum()):,} pts > 0)"
             )
 
+        del jacobian, vorticity
         elapsed = time.perf_counter() - started
         tube_points = tubes.n_points if tubes is not None else 0
         print(
@@ -869,7 +922,7 @@ def build_scene(cache_files: list[Path], force: bool = False):
                 "  Nenhum Q positivo. Esperado para a condição inicial; a "
                 "cena fica sem superfície de vórtice. Em timesteps "
                 "desenvolvidos, compare 'Q* max' com 'bruto': se o bruto "
-                "for alto e o mascarado nulo, Q_MASK_CELLS está largo."
+                "for alto e o mascarado nulo, Q_MASK_DIAMETERS está largo."
             )
         else:
             wake_level = Q_STAR_LEVEL * q_scale
@@ -927,8 +980,22 @@ def build_scene(cache_files: list[Path], force: bool = False):
             flush=True,
         )
 
+    pooled_vorticity = np.concatenate(vorticity_samples)
+    slice_range = [
+        0.0,
+        float(np.percentile(pooled_vorticity, SLICE_PERCENTILE)),
+    ]
+    print(
+        f"Escala global do corte ({SLICE_SCALAR}): 0 a "
+        f"{slice_range[1]:.4g} (percentil {SLICE_PERCENTILE} sobre todos "
+        "os frames)"
+    )
+
     metadata = {
         "target_dx": TARGET_DX,
+        "slice_scalar": SLICE_SCALAR,
+        "slice_range": slice_range,
+        "q_mask_diameters": Q_MASK_DIAMETERS if WAKE_MODE == "q" else None,
         "wake_mode": WAKE_MODE,
         "wake_level": wake_level,
         "q_star": Q_STAR_LEVEL if WAKE_MODE == "q" else None,
@@ -1136,21 +1203,30 @@ def view(metadata):
     lookup_table.scalar_range = speed_range
     lookup_table.nan_opacity = 0.0
 
+    slice_scalar = metadata["slice_scalar"]
+    slice_range = tuple(metadata["slice_range"])
+    slice_table = pv.LookupTable()
+    slice_table.apply_cmap(SLICE_COLORMAP, n_values=256)
+    slice_table.scalar_range = slice_range
+    slice_table.nan_opacity = 0.0
+
     first = frames[0]
 
     # Campo escalar: opaco e sem iluminação, para que a cor represente
-    # exclusivamente o valor de |u|.
+    # exclusivamente o valor medido. O extremo escuro do magma encosta na
+    # cor de fundo, então o plano some onde não há vorticidade e só a
+    # esteira permanece visível — sem transparência e sem custo.
     slice_actor = plotter.add_mesh(
         first["slice"],
         name="velocity_slice",
-        scalars="velocity_magnitude",
-        cmap=COLORMAP,
-        clim=speed_range,
+        scalars=slice_scalar,
+        cmap=SLICE_COLORMAP,
+        clim=slice_range,
         lighting=False,
         show_scalar_bar=False,
         reset_camera=False,
     )
-    slice_actor.mapper.lookup_table = lookup_table
+    slice_actor.mapper.lookup_table = slice_table
 
     # Tubos recebem iluminação: é o que dá volume às linhas.
     streamline_actor = plotter.add_mesh(
@@ -1212,17 +1288,30 @@ def view(metadata):
             print(f"SSAO indisponível: {error}")
 
     plotter.add_scalar_bar(
-        title="|u|",
+        title="|omega| (corte)",
         mapper=slice_actor.mapper,
         n_labels=5,
-        fmt="%.4f",
+        fmt="%.1f",
         color=TEXT_COLOR,
-        position_x=0.88,
+        position_x=0.035,
         position_y=0.18,
-        width=0.040,
+        width=0.030,
         height=0.58,
         vertical=True,
     )
+    if streamline_actor.mapper.GetInput() is not None:
+        plotter.add_scalar_bar(
+            title="|u| (linhas)",
+            mapper=streamline_actor.mapper,
+            n_labels=5,
+            fmt="%.3f",
+            color=TEXT_COLOR,
+            position_x=0.935,
+            position_y=0.18,
+            width=0.030,
+            height=0.58,
+            vertical=True,
+        )
     plotter.add_text(
         "MFLab • Reconstrução AMR refinada",
         position="upper_left",
@@ -1241,7 +1330,9 @@ def view(metadata):
         wake_label = "esteira: sem estrutura no intervalo processado"
     elif metadata["wake_mode"] == "q":
         wake_label = (
-            f"esteira: Q* = Q/(U/D)² = {metadata['q_star']:g}"
+            f"esteira: Q* = Q/(U/D)² = {metadata['q_star']:g}, "
+            f"faixa de {metadata['q_mask_diameters']:g} D junto à parede "
+            "excluída"
         )
     else:
         wake_label = f"esteira: |u| = {level:.2f}"
@@ -1274,9 +1365,9 @@ def view(metadata):
         bind_scalars(
             slice_actor.mapper,
             frame["slice"],
-            "velocity_magnitude",
-            speed_range,
-            lookup_table,
+            slice_scalar,
+            slice_range,
+            slice_table,
         )
         bind_scalars(
             streamline_actor.mapper,
@@ -1347,8 +1438,8 @@ def resolve_output_dir(explicit: str | None) -> Path:
 
 
 def main():
-    global OUTPUT_DIR, TARGET_DX, WAKE_MODE, Q_STAR_LEVEL, Q_MASK_CELLS
-    global CROP_LEVEL
+    global OUTPUT_DIR, TARGET_DX, WAKE_MODE, Q_STAR_LEVEL, Q_MASK_DIAMETERS
+    global CROP_LEVEL, SHOW_STREAMLINES, SLICE_SCALAR
 
     parser = argparse.ArgumentParser(
         description="Reconstrói AMR do MFSim e visualiza o escoamento."
@@ -1401,9 +1492,22 @@ def main():
         help=f"limiar Q/(U/D)² da esteira (padrão: {Q_STAR_LEVEL})",
     )
     parser.add_argument(
-        "--mask-cells",
+        "--mask-d",
         type=float,
-        help=f"células mascaradas junto ao sólido (padrão: {Q_MASK_CELLS})",
+        help=(
+            "faixa excluída junto ao sólido, em diâmetros "
+            f"(padrão: {Q_MASK_DIAMETERS})"
+        ),
+    )
+    parser.add_argument(
+        "--no-streamlines",
+        action="store_true",
+        help="não gera as linhas de corrente",
+    )
+    parser.add_argument(
+        "--slice-scalar",
+        choices=("vorticity_magnitude", "velocity_magnitude"),
+        help=f"escalar do corte central (padrão: {SLICE_SCALAR})",
     )
     parser.add_argument(
         "--dx",
@@ -1424,10 +1528,14 @@ def main():
         WAKE_MODE = args.wake
     if args.q_star is not None:
         Q_STAR_LEVEL = args.q_star
-    if args.mask_cells is not None:
-        Q_MASK_CELLS = args.mask_cells
+    if args.mask_d is not None:
+        Q_MASK_DIAMETERS = args.mask_d
     if args.crop_level is not None:
         CROP_LEVEL = args.crop_level
+    if args.no_streamlines:
+        SHOW_STREAMLINES = False
+    if args.slice_scalar is not None:
+        SLICE_SCALAR = args.slice_scalar
 
     selected = (
         args.preprocess or args.geometry or args.view or args.inspect
