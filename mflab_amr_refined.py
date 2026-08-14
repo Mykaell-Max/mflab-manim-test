@@ -43,6 +43,13 @@ TARGET_DX = 0.004
 # traduzir amr_level em dx nativo; não entra em nenhum cálculo.
 BASE_LEVEL_DX = 0.032
 
+# Recorte: reamostra só a caixa que contém refinamento de nível >= CROP_LEVEL,
+# unida sobre todos os timesteps processados. None = domínio inteiro.
+# Fora dessa caixa o AMR não refinou, então uma grade fina ali apenas
+# interpola dado grosseiro a custo alto.
+CROP_LEVEL = None
+CROP_MARGIN_CELLS = 4
+
 CACHE_DIR_NAME = "mflab_amr_cache"
 CACHE_FLOAT_TYPE = np.float32
 COMPONENTS_TO_CACHE = ("u", "v", "w", "pressure", "dwall_s")
@@ -139,7 +146,59 @@ def discover_hdf5_files() -> list[Path]:
     return files
 
 
-def target_geometry(hdf: h5py.File):
+def refined_bounding_box(files: list[Path], minimum_level: int):
+    """União das caixas de nível >= minimum_level sobre todos os timesteps.
+
+    Lê apenas os metadados 'boxes', nunca os dados, então custa quase nada.
+    A união precisa ser sobre todos os timesteps: o AMR muda de um passo
+    para outro, e a grade de saída tem que ser a mesma em todos os frames.
+    """
+    low = np.full(3, np.inf)
+    high = np.full(3, -np.inf)
+    found = 0
+
+    for path in files:
+        with h5py.File(path, "r") as hdf:
+            origin = vector3_attribute(
+                hdf.attrs["origin"], dtype=float, attribute_name="origin"
+            )
+            for level_index in range(
+                minimum_level, int(hdf.attrs["num_levels"])
+            ):
+                group = hdf[f"level_{level_index}"]
+                boxes = group["boxes"][:]
+                if not len(boxes):
+                    continue
+
+                spacing = vector3_attribute(
+                    group.attrs["vec_dx"],
+                    dtype=float,
+                    attribute_name="vec_dx",
+                )
+                box_low = np.stack(
+                    [boxes["lo_i"], boxes["lo_j"], boxes["lo_k"]], axis=1
+                )
+                box_high = np.stack(
+                    [boxes["hi_i"], boxes["hi_j"], boxes["hi_k"]], axis=1
+                )
+                low = np.minimum(
+                    low, (origin + box_low * spacing).min(axis=0)
+                )
+                high = np.maximum(
+                    high, (origin + (box_high + 1) * spacing).max(axis=0)
+                )
+                found += len(boxes)
+
+    if not found:
+        raise ValueError(
+            f"Nenhum bloco de nível >= {minimum_level} em nenhum timestep."
+        )
+
+    margin = CROP_MARGIN_CELLS * TARGET_DX
+    return low - margin, high + margin
+
+
+def target_geometry(hdf: h5py.File, region=None):
     root = hdf["level_0"]
     domain_attribute = root.attrs["prob_domain"]
 
@@ -193,7 +252,30 @@ def target_geometry(hdf: h5py.File):
             f"Máximo esperado {physical_max}, obtido {reconstructed_max}."
         )
 
-    return physical_min, physical_max, dimensions
+    if region is None:
+        return physical_min, physical_max, dimensions
+
+    # O recorte é feito em índices da própria malha alvo, nunca em
+    # coordenadas soltas: assim os pontos do recorte coincidem exatamente
+    # com os do domínio inteiro, e as duas reconstruções são comparáveis.
+    region_low, region_high = region
+    start = np.floor(
+        (region_low - physical_min) / TARGET_DX + 1.0e-9
+    ).astype(int)
+    stop = np.ceil(
+        (region_high - physical_min) / TARGET_DX - 1.0e-9
+    ).astype(int)
+
+    start = np.maximum(start, 0)
+    stop = np.minimum(stop, dimensions - 1)
+    if np.any(stop <= start):
+        raise ValueError(
+            f"Recorte vazio ou degenerado: início {start}, fim {stop}."
+        )
+
+    cropped_min = physical_min + start * TARGET_DX
+    cropped_max = physical_min + stop * TARGET_DX
+    return cropped_min, cropped_max, stop - start + 1
 
 
 def decode_level(hdf: h5py.File, level_index: int):
@@ -302,10 +384,10 @@ def interpolate_block(array, source_indices):
     )
 
 
-def compose_uniform_grid(hdf5_path: Path) -> pv.ImageData:
+def compose_uniform_grid(hdf5_path: Path, region=None) -> pv.ImageData:
     with h5py.File(hdf5_path, "r") as hdf:
         physical_time = float(hdf.attrs["time"])
-        target_origin, _, dimensions = target_geometry(hdf)
+        target_origin, _, dimensions = target_geometry(hdf, region)
         number_of_levels = int(hdf.attrs["num_levels"])
 
         arrays = {
@@ -406,13 +488,17 @@ def compose_uniform_grid(hdf5_path: Path) -> pv.ImageData:
     grid.point_data["amr_level"] = refinement_level.ravel(order="F")
     grid.field_data["physical_time"] = np.array([physical_time])
     grid.field_data["target_dx"] = np.array([TARGET_DX])
+    grid.field_data["crop_level"] = np.array(
+        [-1 if CROP_LEVEL is None else CROP_LEVEL]
+    )
 
     return grid
 
 
 def cache_directory() -> Path:
     dx_label = str(TARGET_DX).replace(".", "p")
-    return OUTPUT_DIR / f"{CACHE_DIR_NAME}_dx_{dx_label}"
+    suffix = "" if CROP_LEVEL is None else f"_L{CROP_LEVEL}"
+    return OUTPUT_DIR / f"{CACHE_DIR_NAME}_dx_{dx_label}{suffix}"
 
 
 def cache_path_for(hdf5_path: Path) -> Path:
@@ -423,6 +509,25 @@ def preprocess(files: list[Path], force: bool = False):
     destination = cache_directory()
     destination.mkdir(parents=True, exist_ok=True)
 
+    region = None
+    if CROP_LEVEL is not None:
+        # Sempre sobre TODOS os timesteps, nunca sobre a seleção de --steps
+        # ou --frames: a caixa é propriedade do conjunto de dados. Derivá-la
+        # de um subconjunto produziria uma grade diferente com o mesmo nome
+        # de cache, e os frames deixariam de ser comparáveis.
+        region = refined_bounding_box(discover_hdf5_files(), CROP_LEVEL)
+        with h5py.File(files[0], "r") as hdf:
+            _, _, dimensions = target_geometry(hdf, region)
+        print(
+            f"Recorte nível >= {CROP_LEVEL}: "
+            f"{np.round(region[0], 4).tolist()} a "
+            f"{np.round(region[1], 4).tolist()}"
+        )
+        print(
+            f"  grade {dimensions[0]}x{dimensions[1]}x{dimensions[2]} = "
+            f"{int(np.prod(dimensions)):,} pontos por frame"
+        )
+
     print(f"Cache: {destination}")
     for index, path in enumerate(files, start=1):
         cached = cache_path_for(path)
@@ -432,7 +537,7 @@ def preprocess(files: list[Path], force: bool = False):
 
         print(f"[{index:02d}/{len(files):02d}] reconstruindo {path.name}")
         start = time.perf_counter()
-        grid = compose_uniform_grid(path)
+        grid = compose_uniform_grid(path, region)
         grid.save(cached, binary=True)
         elapsed = time.perf_counter() - start
 
@@ -1239,6 +1344,7 @@ def resolve_output_dir(explicit: str | None) -> Path:
 
 def main():
     global OUTPUT_DIR, TARGET_DX, WAKE_MODE, Q_STAR_LEVEL, Q_MASK_CELLS
+    global CROP_LEVEL
 
     parser = argparse.ArgumentParser(
         description="Reconstrói AMR do MFSim e visualiza o escoamento."
@@ -1300,6 +1406,11 @@ def main():
         type=float,
         help=f"espaçamento alvo (padrão: {TARGET_DX})",
     )
+    parser.add_argument(
+        "--crop-level",
+        type=int,
+        help="recorta na caixa com refinamento de nível >= N",
+    )
     args = parser.parse_args()
 
     OUTPUT_DIR = resolve_output_dir(args.data)
@@ -1311,6 +1422,8 @@ def main():
         Q_STAR_LEVEL = args.q_star
     if args.mask_cells is not None:
         Q_MASK_CELLS = args.mask_cells
+    if args.crop_level is not None:
+        CROP_LEVEL = args.crop_level
 
     selected = (
         args.preprocess or args.geometry or args.view or args.inspect
