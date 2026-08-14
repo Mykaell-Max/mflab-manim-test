@@ -722,9 +722,18 @@ def fluid_distance(grid) -> np.ndarray | None:
     if not negative.any() or not positive.any():
         return distance
 
-    if speed[negative].mean() < speed[positive].mean():
-        return distance
-    return -distance
+    slower = float(speed[negative].mean())
+    faster = float(speed[positive].mean())
+
+    # O critério de velocidade falha exatamente onde não há contraste: na
+    # condição inicial o campo é uniforme, |u| dentro e fora do corpo são
+    # iguais, a comparação dá falso e o sinal era invertido — marcando 99,9%
+    # do domínio como sólido. Sem contraste, decide pela geometria: o corpo
+    # imerso é a região minoritária, o fluido ocupa o resto.
+    if abs(slower - faster) < 1.0e-6 * max(abs(faster), 1.0e-9):
+        return distance if negative.sum() < positive.sum() else -distance
+
+    return distance if slower < faster else -distance
 
 
 def vorticity_magnitude(jacobian) -> np.ndarray:
@@ -2500,10 +2509,14 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
         )
 
     plotter.enable_lightkit()
+    # SSAA (supersampling) apaga completamente o volume: medido em 0% dos
+    # pixels contra 9% sem anti-aliasing. O passe de volume não sobrevive ao
+    # render em resolução ampliada. FXAA é pós-processo e convive.
+    antialiasing = "fxaa" if SHOW_VOLUME else "ssaa"
     try:
-        plotter.enable_anti_aliasing("ssaa")
+        plotter.enable_anti_aliasing(antialiasing)
     except Exception as error:  # noqa: BLE001 - depende do driver
-        print(f"SSAA indisponível: {error}")
+        print(f"anti-aliasing {antialiasing} indisponível: {error}")
 
     # Anotação: sem isto o vídeo é uma imagem bonita sem valor de engenharia.
     # Tudo que altera a leitura do dado precisa estar declarado no quadro.
