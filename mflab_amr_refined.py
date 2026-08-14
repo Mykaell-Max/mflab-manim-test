@@ -2257,7 +2257,7 @@ def resolve_output_dir(explicit: str | None) -> Path:
 def main():
     global OUTPUT_DIR, TARGET_DX, WAKE_MODE, Q_STAR_LEVEL, Q_MASK_DIAMETERS
     global CROP_LEVEL, SHOW_STREAMLINES, SLICE_SCALAR, SPHERE_MODE
-    global SHOW_LIC
+    global SHOW_LIC, VIDEO_SECONDS
 
     parser = argparse.ArgumentParser(
         description="Reconstrói AMR do MFSim e visualiza o escoamento."
@@ -2298,6 +2298,14 @@ def main():
         "--no-lic",
         action="store_true",
         help="desliga a textura LIC no vídeo",
+    )
+    parser.add_argument(
+        "--seconds",
+        type=float,
+        help=(
+            "duração do vídeo em segundos "
+            f"(padrão: {VIDEO_SECONDS:g}); use um valor curto para testar"
+        ),
     )
     parser.add_argument(
         "--force",
@@ -2384,6 +2392,8 @@ def main():
         SPHERE_MODE = args.sphere
     if args.no_lic:
         SHOW_LIC = False
+    if args.seconds is not None:
+        VIDEO_SECONDS = args.seconds
 
     render_video_requested = args.render or args.preview is not None
     selected = (
