@@ -1981,6 +1981,11 @@ def load_fields(cache_files):
         speed = as_block(
             np.asarray(grid.point_data["velocity_magnitude"]), shape
         ).astype(np.float32)
+        print(
+            f"    campo {index}/{len(cache_files)} • lido do VTI: "
+            f"|u| {speed.min():.6f} a {speed.max():.6f}",
+            flush=True,
+        )
 
         # Dentro do sólido |u| = 0, o que a curva de opacidade leria como
         # esteira intensa e encheria a esfera de névoa. O corpo já é
@@ -1988,16 +1993,39 @@ def load_fields(cache_files):
         distance = fluid_distance(grid)
         if distance is not None:
             solid = np.isfinite(distance) & (distance < 0.0)
+            fraction = solid.mean() * 100.0
+            print(
+                f"      mascara do solido: {int(solid.sum()):,} pontos "
+                f"= {fraction:.3f}% do volume"
+            )
+            if fraction > 20.0:
+                print(
+                    "      >>> SUSPEITO: a mascara do solido cobre mais de "
+                    "20% do dominio. O sinal de dwall_s pode estar "
+                    "invertido; o corpo ocupa uma fracao minima."
+                )
             speed[as_block(solid, shape)] = REFERENCE_VELOCITY
+            print(
+                f"      apos mascara: |u| {speed.min():.6f} a "
+                f"{speed.max():.6f}"
+            )
 
         if LEVEL_MATCHED_SMOOTHING and "amr_level" in grid.point_data:
             level = as_block(
                 np.asarray(grid.point_data["amr_level"]), shape
             )
             speed = level_matched_smoothing(speed, level, target_dx)
+            print(
+                f"      apos suavizacao AMR: |u| {speed.min():.6f} a "
+                f"{speed.max():.6f}"
+            )
 
+        deficit = int((speed < 1.0 - VOLUME_DEFICIT_FLOOR).sum())
+        print(
+            f"      pontos opacos (|u| < {1.0 - VOLUME_DEFICIT_FLOOR:.2f}): "
+            f"{deficit:,} = {deficit / speed.size * 100:.3f}%"
+        )
         speeds.append(speed)
-        print(f"    campo {index}/{len(cache_files)}", flush=True)
 
     megabytes = (
         sum(field.nbytes for field in fields)
@@ -2096,7 +2124,16 @@ def diagnose_volume(cache_files: list[Path], metadata):
         print(f"  capacidades indisponíveis: {error}")
 
     print("\n===== 2. DADO =====")
-    fields, speeds, times, origin, spacing = load_fields(cache_files[:1])
+    print(f"  {len(cache_files)} arquivos no cache:")
+    for path in cache_files:
+        print(f"    {path.name}")
+
+    # Escolher o primeiro timestep é uma armadilha: ct.000000000 é a
+    # condição inicial, campo uniforme, |u| = 1 em todo o domínio por
+    # definição. Um volume invisível ali é o resultado correto, não um bug.
+    chosen = cache_files[len(cache_files) // 2]
+    print(f"\n  amostrando o timestep do meio: {chosen.name}")
+    fields, speeds, times, origin, spacing = load_fields([chosen])
     speed = speeds[0]
     print(f"  shape {speed.shape} • dtype {speed.dtype}")
     print(f"  |u| min {speed.min():.6f} • max {speed.max():.6f}")
@@ -2111,7 +2148,12 @@ def diagnose_volume(cache_files: list[Path], metadata):
         f"{abaixo:,} = {abaixo / speed.size * 100:.3f}% do volume"
     )
     if abaixo == 0:
-        print("  >>> FALHA AQUI: nenhum ponto opaco. O campo não tem déficit.")
+        print(
+            "  >>> Nenhum ponto opaco NESTE timestep. Se for a condição "
+            "inicial, é o resultado correto: campo uniforme não tem "
+            "déficit. Confira em um timestep desenvolvido antes de tratar "
+            "como falha."
+        )
 
     print("\n===== 3. FUNCAO DE OPACIDADE =====")
     clim = tuple(metadata["speed_range"])
