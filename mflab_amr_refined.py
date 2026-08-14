@@ -2418,6 +2418,7 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
     )
 
     volume_grid = None
+    volume_dataset = None
     if SHOW_VOLUME:
         volume_grid = pv.ImageData(
             dimensions=shape,
@@ -2471,6 +2472,13 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
             f"  interpolação {volume_actor.prop.GetInterpolationTypeAsString()}"
             f" • passo do raio {VOLUME_SAMPLE_CELLS:g} célula"
         )
+
+        # add_volume copia o dataset: escrever no grid original não chega ao
+        # mapper. Guardo a referência interna, que é o que precisa ser
+        # atualizado a cada troca de timestep. Sem isto o volume ficava
+        # congelado no primeiro campo — a condição inicial uniforme, que é
+        # transparente, e o volume não aparecia em nenhum frame.
+        volume_dataset = volume_actor.mapper.dataset
         crossing = 2.0 * diameter / unit
         print(
             f"  volume: opacidade {VOLUME_MAX_OPACITY:g} por "
@@ -2642,11 +2650,12 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
             continue
 
         nearest = int(np.argmin(np.abs(times - physical)))
-        if nearest != current_wake and volume_grid is not None:
-            volume_grid.point_data["speed"] = speeds[nearest].ravel(
+        if nearest != current_wake and volume_dataset is not None:
+            volume_dataset.point_data["speed"] = speeds[nearest].ravel(
                 order="F"
             )
-            volume_grid.Modified()
+            volume_dataset.Modified()
+            volume_actor.mapper.Modified()
         if nearest != current_wake:
             wake_actor.mapper.SetInputData(
                 read_optional(
