@@ -1317,15 +1317,19 @@ def view(metadata):
     plotter.add_key_event("Left", step_backward)
 
     show_frame(first)
-    # O laço roda em um timer do VTK; o interactor continua livre para a
-    # câmera, ao contrário de um for com time.sleep.
-    plotter.add_timer_event(
-        max_steps=2_000_000_000,
-        duration=FRAME_DURATION_MS,
-        callback=advance,
-    )
-
-    print("espaço: pausa • setas: frame a frame • q: sair")
+    if len(frames) > 1:
+        # O laço roda em um timer do VTK; o interactor continua livre para
+        # a câmera, ao contrário de um for com time.sleep.
+        plotter.add_timer_event(
+            max_steps=2_000_000_000,
+            duration=FRAME_DURATION_MS,
+            callback=advance,
+        )
+        print("espaço: pausa • setas: frame a frame • q: sair")
+    else:
+        # Um frame só: sem timer, senão o VTK redesenha a mesma imagem
+        # indefinidamente e disputa com a interação de câmera.
+        print("frame único • q: sair")
     plotter.show()
 
 
