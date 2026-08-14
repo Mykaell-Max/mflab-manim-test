@@ -119,6 +119,29 @@ CAMERA_FOCUS_OFFSET_D = 2.5
 WINDOW_SIZE = (1600, 900)
 ENABLE_SSAO = True
 
+# --- vídeo -------------------------------------------------------------------
+# A Re ~ 100 o escoamento é estacionário: depois que a esteira se forma, os
+# frames de dado são quase idênticos. O movimento do vídeo vem das partículas
+# advectadas e da textura LIC, não da mudança do campo.
+VIDEO_FPS = 60
+VIDEO_SECONDS = 20.0
+VIDEO_SIZE = (1920, 1080)
+
+PARTICLE_COUNT = 24_000
+PARTICLE_TRAIL = 7  # posições passadas desenhadas como rastro
+PARTICLE_LIFETIME_SECONDS = 6.0
+PARTICLE_SIZE = 3.0
+
+SHOW_LIC = True
+LIC_WIDTH = 1024
+LIC_STEPS = 48
+LIC_CYCLES = 3.0  # listras por janela de convolução
+LIC_TURNS_PER_SECOND = 0.55
+LIC_CONTRAST = 0.65  # quanto a textura modula a cor do campo
+LIC_FLIP_V = False  # inverta se a textura sair espelhada na vertical
+
+CAMERA_ORBIT_DEGREES = 16.0
+
 BACKGROUND = "#07131F"
 TEXT_COLOR = "#F1F6F9"
 # Corpo sólido em cinza neutro e fosco; estrutura de vórtice em ciano
@@ -594,20 +617,27 @@ def as_block(values, shape):
     return np.asarray(values).reshape(shape, order="F")
 
 
+def jacobian_from_block(field, spacing):
+    """jacobian[a][b] = d(u_a) / d(x_b), de um bloco (nx, ny, nz, 3)."""
+    return [
+        [
+            derivative.astype(np.float32, copy=False)
+            for derivative in np.gradient(
+                field[..., axis], spacing, spacing, spacing
+            )
+        ]
+        for axis in range(3)
+    ]
+
+
 def velocity_jacobian(grid):
     """jacobian[a][b] = d(u_a) / d(x_b), por diferenças centrais."""
     shape = grid_shape(grid)
-    spacing = float(grid.spacing[0])
     velocity = np.asarray(grid.point_data["velocity"])
-
-    jacobian = []
-    for axis in range(3):
-        component = as_block(velocity[:, axis], shape)
-        derivatives = np.gradient(component, spacing, spacing, spacing)
-        jacobian.append(
-            [d.astype(np.float32, copy=False) for d in derivatives]
-        )
-    return jacobian
+    field = np.stack(
+        [as_block(velocity[:, axis], shape) for axis in range(3)], axis=-1
+    )
+    return jacobian_from_block(field, float(grid.spacing[0]))
 
 
 def q_criterion(jacobian) -> np.ndarray:
@@ -1314,6 +1344,161 @@ def inspect_cache(cache_files: list[Path]):
                 )
 
 
+# -----------------------------------------------------------------------------
+# Advecção de partículas
+# -----------------------------------------------------------------------------
+
+def as_vector_block(grid) -> np.ndarray:
+    """point_data 'velocity' -> bloco (nx, ny, nz, 3)."""
+    shape = grid_shape(grid)
+    velocity = np.asarray(grid.point_data["velocity"], dtype=np.float32)
+    return np.stack(
+        [velocity[:, axis].reshape(shape, order="F") for axis in range(3)],
+        axis=-1,
+    )
+
+
+def sample_vectors(field, origin, spacing, positions):
+    """Interpolação trilinear do campo nas posições dadas."""
+    coordinates = ((positions - origin) / spacing).T
+    return np.stack(
+        [
+            map_coordinates(
+                field[..., axis],
+                coordinates,
+                order=1,
+                mode="nearest",
+                prefilter=False,
+            )
+            for axis in range(3)
+        ],
+        axis=-1,
+    )
+
+
+def advect_rk4(positions, sampler, dt):
+    """Runge-Kutta 4. Passo fixo: o campo é suave e o dt vem do fps."""
+    k1 = sampler(positions)
+    k2 = sampler(positions + 0.5 * dt * k1)
+    k3 = sampler(positions + 0.5 * dt * k2)
+    k4 = sampler(positions + dt * k3)
+    return positions + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+
+
+def spawn_positions(count, bounds, generator, inlet_fraction=0.02):
+    """Semeia na face de entrada, distribuído pela seção transversal."""
+    xmin, xmax, ymin, ymax, zmin, zmax = bounds
+    span = xmax - xmin
+    return np.column_stack(
+        [
+            generator.uniform(xmin, xmin + inlet_fraction * span, count),
+            generator.uniform(ymin, ymax, count),
+            generator.uniform(zmin, zmax, count),
+        ]
+    ).astype(np.float32)
+
+
+def expired(positions, ages, bounds, lifetime):
+    """Partículas que saíram do domínio ou envelheceram demais.
+
+    O limite de idade existe por causa da bolha de recirculação: uma
+    partícula capturada ali nunca sai sozinha, e sem renovação a população
+    inteira acabaria acumulada dentro do toro.
+    """
+    xmin, xmax, ymin, ymax, zmin, zmax = bounds
+    outside = (
+        (positions[:, 0] < xmin)
+        | (positions[:, 0] > xmax)
+        | (positions[:, 1] < ymin)
+        | (positions[:, 1] > ymax)
+        | (positions[:, 2] < zmin)
+        | (positions[:, 2] > zmax)
+    )
+    return outside | (ages > lifetime)
+
+
+def trail_connectivity(count, trail):
+    """Conectividade VTK de uma polilinha por partícula, constante."""
+    cells = np.empty((count, trail + 1), dtype=np.int64)
+    cells[:, 0] = trail
+    indices = np.arange(count, dtype=np.int64)
+    for position in range(trail):
+        cells[:, position + 1] = position * count + indices
+    return cells.ravel()
+
+
+# -----------------------------------------------------------------------------
+# Line Integral Convolution
+# -----------------------------------------------------------------------------
+
+def lic_samples(vx, vy, noise, steps):
+    """Amostras de ruído ao longo da linha de corrente de cada pixel.
+
+    Devolve (2*steps, altura, largura). O caro é isto, e só depende do
+    campo — não da fase. Como o campo é praticamente estacionário, isto é
+    calculado uma vez por timestep de dado e reaproveitado por todos os
+    frames de vídeo, que passam a custar apenas uma soma ponderada.
+    """
+    height, width = vx.shape
+    grid_y, grid_x = np.mgrid[0:height, 0:width].astype(np.float32)
+
+    magnitude = np.maximum(np.hypot(vx, vy), 1.0e-12)
+    unit_x = (vx / magnitude).astype(np.float32)
+    unit_y = (vy / magnitude).astype(np.float32)
+
+    collected = np.empty((2 * steps, height, width), dtype=np.float32)
+
+    for order, direction in enumerate((1.0, -1.0)):
+        position_x = grid_x.copy()
+        position_y = grid_y.copy()
+        for step in range(steps):
+            coordinates = np.stack([position_y.ravel(), position_x.ravel()])
+            collected[order * steps + step] = map_coordinates(
+                noise,
+                coordinates,
+                order=1,
+                mode="wrap",
+                prefilter=False,
+            ).reshape(height, width)
+
+            local = np.stack([position_y.ravel(), position_x.ravel()])
+            position_x += direction * map_coordinates(
+                unit_x, local, order=1, mode="nearest", prefilter=False
+            ).reshape(height, width)
+            position_y += direction * map_coordinates(
+                unit_y, local, order=1, mode="nearest", prefilter=False
+            ).reshape(height, width)
+
+    return collected
+
+
+def lic_weights(steps, phase, cycles):
+    """Núcleo periódico deslocado pela fase.
+
+    Deslocar a fase a cada frame faz o padrão caminhar ao longo das linhas
+    de corrente: é isso que produz a sensação de escoamento, sem alterar
+    nenhum valor do campo.
+    """
+    arc = np.arange(steps, dtype=np.float32) + 0.5
+    signed = np.concatenate([arc, -arc])
+    weights = 0.5 * (
+        1.0 + np.cos(2.0 * np.pi * (cycles * signed / steps - phase))
+    )
+    return (weights / weights.sum()).astype(np.float32)
+
+
+def lic_luminance(samples, phase, cycles):
+    """Combina as amostras com o núcleo, normalizando para [0, 1]."""
+    steps = samples.shape[0] // 2
+    weights = lic_weights(steps, phase, cycles)
+    image = np.tensordot(weights, samples, axes=(0, 0))
+
+    low, high = np.percentile(image, (2.0, 98.0))
+    if high <= low:
+        return np.full_like(image, 0.5)
+    return np.clip((image - low) / (high - low), 0.0, 1.0)
+
+
 def discover_cache_files() -> list[Path]:
     files = sorted(cache_directory().glob("ct.*.vti"))
     if not files:
@@ -1636,6 +1821,336 @@ def view(metadata):
 
 
 # -----------------------------------------------------------------------------
+# Renderização de vídeo
+# -----------------------------------------------------------------------------
+
+def video_directory() -> Path:
+    return scene_directory() / "video"
+
+
+def load_fields(cache_files):
+    """Campos de velocidade de todos os timesteps, em memória."""
+    fields, times = [], []
+    origin = spacing = None
+    for path in cache_files:
+        grid = pv.read(path)
+        fields.append(as_vector_block(grid))
+        times.append(physical_time(grid))
+        origin = np.asarray(grid.origin, dtype=np.float32)
+        spacing = np.asarray(grid.spacing, dtype=np.float32)
+    megabytes = sum(field.nbytes for field in fields) / 1024 ** 2
+    print(f"  {len(fields)} campos de velocidade • {megabytes:,.0f} MB")
+    return fields, np.asarray(times), origin, spacing
+
+
+def plane_texture_image(luminance, vorticity, slice_range, table):
+    """Combina a textura LIC com a cor do campo escalar.
+
+    A luminância vem do LIC (direção do escoamento) e a matiz vem da
+    vorticidade (intensidade). São dois canais independentes carregando
+    duas grandezas distintas — nada é inventado.
+    """
+    normalized = np.clip(
+        (vorticity - slice_range[0])
+        / max(slice_range[1] - slice_range[0], 1.0e-12),
+        0.0,
+        1.0,
+    )
+    indices = (normalized * (len(table) - 1)).astype(np.int32)
+    rgba = table[indices].astype(np.float32)
+
+    shade = (1.0 - LIC_CONTRAST) + LIC_CONTRAST * luminance
+    rgba[..., :3] *= shade[..., None]
+    return np.clip(rgba, 0, 255).astype(np.uint8)
+
+
+def resample_plane(plane, width, height):
+    """Reamostra um plano (nx, nz) para a resolução da textura."""
+    rows = np.linspace(0, plane.shape[1] - 1, height, dtype=np.float32)
+    columns = np.linspace(0, plane.shape[0] - 1, width, dtype=np.float32)
+    mesh_rows, mesh_columns = np.meshgrid(rows, columns, indexing="ij")
+    return map_coordinates(
+        plane,
+        np.stack([mesh_columns.ravel(), mesh_rows.ravel()]),
+        order=1,
+        mode="nearest",
+        prefilter=False,
+    ).reshape(height, width)
+
+
+def prepare_lic(fields, spacing, slice_index, width):
+    """Amostras LIC e vorticidade do plano, por timestep de dado."""
+    shape = fields[0].shape[:3]
+    height = max(2, int(round(width * shape[2] / shape[0])))
+    generator = np.random.default_rng(12345)
+    noise = generator.random((height, width)).astype(np.float32)
+
+    samples, vorticities = [], []
+    for index, field in enumerate(fields):
+        jacobian = jacobian_from_block(field, float(spacing[0]))
+        vorticity = vorticity_magnitude(jacobian)[:, slice_index, :]
+        del jacobian
+
+        velocity_x = resample_plane(
+            field[:, slice_index, :, 0], width, height
+        )
+        velocity_z = resample_plane(
+            field[:, slice_index, :, 2], width, height
+        )
+        samples.append(lic_samples(velocity_x, velocity_z, noise, LIC_STEPS))
+        vorticities.append(resample_plane(vorticity, width, height))
+        print(
+            f"    LIC {index + 1}/{len(fields)} • "
+            f"{height}x{width}",
+            flush=True,
+        )
+
+    total = sum(block.nbytes for block in samples) / 1024 ** 3
+    print(f"  amostras LIC em memória: {total:.2f} GB")
+    return samples, vorticities, height, width
+
+
+def render_video(cache_files: list[Path], metadata, preview: int | None):
+    destination = video_directory()
+    destination.mkdir(parents=True, exist_ok=True)
+
+    print("Carregando campos...")
+    fields, times, origin, spacing = load_fields(cache_files)
+    shape = fields[0].shape[:3]
+    bounds = (
+        float(origin[0]),
+        float(origin[0] + (shape[0] - 1) * spacing[0]),
+        float(origin[1]),
+        float(origin[1] + (shape[1] - 1) * spacing[1]),
+        float(origin[2]),
+        float(origin[2] + (shape[2] - 1) * spacing[2]),
+    )
+
+    center = np.asarray(metadata["sphere_center"], dtype=np.float32)
+    diameter = 2.0 * float(metadata["sphere_radius"])
+    slice_index = int(round((center[1] - origin[1]) / spacing[1]))
+    slice_range = tuple(metadata["slice_range"])
+
+    slice_table = pv.LookupTable()
+    slice_table.apply_cmap(SLICE_COLORMAP, n_values=256)
+    table_values = np.asarray(slice_table.values).copy()
+    ramp = np.clip(
+        np.linspace(0.0, 1.0, len(table_values)) / SLICE_FADE_FRACTION,
+        0.0,
+        1.0,
+    )
+    table_values[:, 3] = (ramp * 255).astype(np.uint8)
+
+    lic_data = None
+    if SHOW_LIC:
+        print("Pré-calculando LIC (uma vez por timestep de dado)...")
+        lic_data = prepare_lic(fields, spacing, slice_index, LIC_WIDTH)
+
+    total_frames = (
+        1 if preview is not None else int(VIDEO_FPS * VIDEO_SECONDS)
+    )
+    time_span = float(times[-1] - times[0]) if len(times) > 1 else 1.0
+    dt = time_span / max(total_frames - 1, 1)
+
+    generator = np.random.default_rng(7)
+    positions = np.column_stack(
+        [
+            generator.uniform(bounds[0], bounds[1], PARTICLE_COUNT),
+            generator.uniform(bounds[2], bounds[3], PARTICLE_COUNT),
+            generator.uniform(bounds[4], bounds[5], PARTICLE_COUNT),
+        ]
+    ).astype(np.float32)
+    ages = generator.uniform(
+        0.0, PARTICLE_LIFETIME_SECONDS, PARTICLE_COUNT
+    ).astype(np.float32)
+    history = np.repeat(positions[None], PARTICLE_TRAIL, axis=0)
+    speed_history = np.zeros(
+        (PARTICLE_TRAIL, PARTICLE_COUNT), dtype=np.float32
+    )
+    connectivity = trail_connectivity(PARTICLE_COUNT, PARTICLE_TRAIL)
+
+    plotter = pv.Plotter(off_screen=True, window_size=list(VIDEO_SIZE))
+    plotter.set_background(BACKGROUND)
+    plotter.enable_parallel_projection()
+
+    plane = pv.PolyData(
+        np.array(
+            [
+                [bounds[0], float(center[1]), bounds[4]],
+                [bounds[1], float(center[1]), bounds[4]],
+                [bounds[1], float(center[1]), bounds[5]],
+                [bounds[0], float(center[1]), bounds[5]],
+            ],
+            dtype=float,
+        ),
+        np.array([4, 0, 1, 2, 3]),
+    )
+    plane.active_texture_coordinates = np.array(
+        [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]
+    )
+
+    sphere = read_optional(scene_directory() / "sphere.vtp")
+    if sphere.n_points:
+        plotter.add_mesh(
+            sphere,
+            color=GEOMETRY_COLOR,
+            smooth_shading=True,
+            specular=0.30,
+            specular_power=20,
+            ambient=0.18,
+            reset_camera=False,
+        )
+
+    wake_actor = plotter.add_mesh(
+        read_optional(
+            scene_directory() / f"wake.{timestep_number(cache_files[0]):09d}.vtp"
+        ),
+        color=WAKE_COLOR,
+        opacity=0.45,
+        smooth_shading=True,
+        specular=0.25,
+        show_scalar_bar=False,
+        reset_camera=False,
+    )
+
+    tracers = pv.PolyData()
+    tracers.points = history.reshape(-1, 3)
+    tracers.lines = connectivity
+    tracers.point_data["speed"] = speed_history.ravel()
+    tracer_actor = plotter.add_mesh(
+        tracers,
+        scalars="speed",
+        cmap=COLORMAP,
+        clim=metadata["speed_range"],
+        line_width=PARTICLE_SIZE * 0.5,
+        opacity=0.85,
+        lighting=False,
+        show_scalar_bar=False,
+        reset_camera=False,
+    )
+
+    plane_actor = None
+    if SHOW_LIC:
+        plane_actor = plotter.add_mesh(
+            plane, lighting=False, reset_camera=False
+        )
+
+    plotter.enable_lightkit()
+    try:
+        plotter.enable_anti_aliasing("ssaa")
+    except Exception as error:  # noqa: BLE001 - depende do driver
+        print(f"SSAA indisponível: {error}")
+
+    focus = center + np.array(
+        [CAMERA_FOCUS_OFFSET_D * diameter, 0.0, 0.0], dtype=np.float32
+    )
+    base_offset = np.asarray(CAMERA_DIRECTION, dtype=float) * (
+        bounds[1] - bounds[0]
+    )
+
+    started = time.perf_counter()
+    for frame in range(total_frames):
+        index = preview if preview is not None else frame
+        fraction = index / max(int(VIDEO_FPS * VIDEO_SECONDS) - 1, 1)
+        physical = float(times[0]) + fraction * time_span
+
+        upper = int(np.searchsorted(times, physical, side="right"))
+        upper = min(max(upper, 1), len(times) - 1)
+        lower = upper - 1
+        gap = float(times[upper] - times[lower])
+        blend = 0.0 if gap <= 0 else (physical - times[lower]) / gap
+
+        def sampler(points, lower=lower, upper=upper, blend=blend):
+            low = sample_vectors(fields[lower], origin, spacing, points)
+            high = sample_vectors(fields[upper], origin, spacing, points)
+            return (1.0 - blend) * low + blend * high
+
+        positions = advect_rk4(positions, sampler, dt)
+        ages += dt
+
+        dead = expired(positions, ages, bounds, PARTICLE_LIFETIME_SECONDS)
+        if dead.any():
+            fresh = spawn_positions(int(dead.sum()), bounds, generator)
+            positions[dead] = fresh
+            ages[dead] = 0.0
+            # Rastro inteiro reposicionado: senão a partícula renascida
+            # apareceria ligada por uma linha à sua posição anterior.
+            history[:, dead, :] = fresh
+
+        velocity = sampler(positions)
+        history = np.roll(history, 1, axis=0)
+        history[0] = positions
+        speed_history = np.roll(speed_history, 1, axis=0)
+        speed_history[0] = np.linalg.norm(velocity, axis=1)
+
+        tracers.points = history.reshape(-1, 3)
+        tracers.point_data["speed"] = speed_history.ravel()
+
+        nearest = int(np.argmin(np.abs(times - physical)))
+        wake_actor.mapper.SetInputData(
+            read_optional(
+                scene_directory()
+                / f"wake.{timestep_number(cache_files[nearest]):09d}.vtp"
+            )
+        )
+        wake_actor.mapper.ScalarVisibilityOff()
+
+        if SHOW_LIC and plane_actor is not None:
+            samples, vorticities, height, width = lic_data
+            phase = LIC_TURNS_PER_SECOND * index / VIDEO_FPS
+            luminance = (1.0 - blend) * lic_luminance(
+                samples[lower], phase, LIC_CYCLES
+            ) + blend * lic_luminance(samples[upper], phase, LIC_CYCLES)
+            vorticity = (1.0 - blend) * vorticities[lower] + (
+                blend * vorticities[upper]
+            )
+            image = plane_texture_image(
+                luminance, vorticity, slice_range, table_values
+            )
+            if LIC_FLIP_V:
+                image = image[::-1]
+            plane_actor.SetTexture(pv.Texture(image))
+
+        angle = CAMERA_ORBIT_DEGREES * (fraction - 0.5)
+        radians = np.radians(angle)
+        cosine, sine = np.cos(radians), np.sin(radians)
+        offset = np.array(
+            [
+                cosine * base_offset[0] - sine * base_offset[1],
+                sine * base_offset[0] + cosine * base_offset[1],
+                base_offset[2],
+            ]
+        )
+        camera = plotter.camera
+        camera.focal_point = tuple(float(value) for value in focus)
+        camera.position = tuple(float(value) for value in focus + offset)
+        camera.up = (0.0, 0.0, 1.0)
+        camera.parallel_scale = 0.5 * CAMERA_FRAME_DIAMETERS * diameter
+        plotter.reset_camera_clipping_range()
+
+        output = destination / f"frame_{index:05d}.png"
+        plotter.screenshot(str(output))
+
+        if frame % 30 == 0 or frame == total_frames - 1:
+            elapsed = time.perf_counter() - started
+            rate = (frame + 1) / max(elapsed, 1.0e-9)
+            print(
+                f"  frame {frame + 1}/{total_frames} • t = {physical:.5f} • "
+                f"{rate:.1f} fps • restam "
+                f"{(total_frames - frame - 1) / max(rate, 1e-9):.0f} s",
+                flush=True,
+            )
+
+    plotter.close()
+    print(f"\nPNGs em {destination}")
+    print(
+        f"\nffmpeg -framerate {VIDEO_FPS} -i "
+        f"'{destination}/frame_%05d.png' -c:v libx264 -pix_fmt yuv420p "
+        f"-crf 16 '{destination}/mflab_esfera_re100.mp4'"
+    )
+
+
+# -----------------------------------------------------------------------------
 # CLI
 # -----------------------------------------------------------------------------
 
@@ -1651,6 +2166,7 @@ def resolve_output_dir(explicit: str | None) -> Path:
 def main():
     global OUTPUT_DIR, TARGET_DX, WAKE_MODE, Q_STAR_LEVEL, Q_MASK_DIAMETERS
     global CROP_LEVEL, SHOW_STREAMLINES, SLICE_SCALAR, SPHERE_MODE
+    global SHOW_LIC
 
     parser = argparse.ArgumentParser(
         description="Reconstrói AMR do MFSim e visualiza o escoamento."
@@ -1675,6 +2191,22 @@ def main():
         "--view",
         action="store_true",
         help="anima a geometria já calculada",
+    )
+    parser.add_argument(
+        "--render",
+        action="store_true",
+        help="renderiza os PNGs do vídeo (partículas + LIC)",
+    )
+    parser.add_argument(
+        "--preview",
+        type=int,
+        metavar="FRAME",
+        help="renderiza só um frame do vídeo, para conferir antes",
+    )
+    parser.add_argument(
+        "--no-lic",
+        action="store_true",
+        help="desliga a textura LIC no vídeo",
     )
     parser.add_argument(
         "--force",
@@ -1759,9 +2291,16 @@ def main():
         SLICE_SCALAR = args.slice_scalar
     if args.sphere is not None:
         SPHERE_MODE = args.sphere
+    if args.no_lic:
+        SHOW_LIC = False
 
+    render_video_requested = args.render or args.preview is not None
     selected = (
-        args.preprocess or args.geometry or args.view or args.inspect
+        args.preprocess
+        or args.geometry
+        or args.view
+        or args.inspect
+        or render_video_requested
     )
     run_preprocess = args.preprocess or not selected
     run_geometry = args.geometry or not selected
@@ -1789,6 +2328,11 @@ def main():
 
     if run_geometry:
         build_scene(select(discover_cache_files()), force=args.force)
+
+    if render_video_requested:
+        render_video(
+            select(discover_cache_files()), load_scene(), args.preview
+        )
 
     if run_view:
         view(load_scene())
