@@ -162,8 +162,16 @@ VOLUME_GAMMA = 1.35
 # isso faz um raio cruzar a esteira inteira acumulando ~2% de opacidade, e o
 # volume some. Amarrar a unidade ao dx torna o valor previsível: atravessar
 # N células acumula 1 - (1 - opacidade)^N.
-VOLUME_MAX_OPACITY = 0.06
+VOLUME_MAX_OPACITY = 0.20
 VOLUME_UNIT_CELLS = 1.0
+# Passo do raio em células. Menor que 1 integra mais fino e suaviza a
+# renderização; o custo é linear e o render é offline.
+VOLUME_SAMPLE_CELLS = 0.5
+# Faixa excluída ao redor do corpo, em células. O método de fronteira imersa
+# borra a interface por 1 a 2 células: ali o valor é mistura de sólido e
+# fluido, não medida. Sem excluir, essa casca aparece como uma bola de
+# voxels grudada na esfera.
+VOLUME_SOLID_BAND_CELLS = 1.5
 # Colormap invertido de propósito. O que se exibe é a região LENTA; numa
 # escala convencional ela cai no extremo escuro e desaparece contra o fundo.
 # Invertida, o núcleo lento é o mais claro e o escoamento livre — que já é
@@ -1992,7 +2000,8 @@ def load_fields(cache_files):
         # desenhado como superfície opaca; aqui ele vira escoamento livre.
         distance = fluid_distance(grid)
         if distance is not None:
-            solid = np.isfinite(distance) & (distance < 0.0)
+            band = VOLUME_SOLID_BAND_CELLS * target_dx
+            solid = np.isfinite(distance) & (distance < band)
             fraction = solid.mean() * 100.0
             print(
                 f"      mascara do solido: {int(solid.sum()):,} pontos "
@@ -2218,6 +2227,11 @@ def diagnose_volume(cache_files: list[Path], metadata):
                 ajustada.AddPoint(float(v), float(a))
             actor.prop.SetScalarOpacity(ajustada)
         actor.prop.SetScalarOpacityUnitDistance(unit)
+        actor.prop.SetInterpolationTypeToLinear()
+        actor.mapper.SetAutoAdjustSampleDistances(False)
+        actor.mapper.SetSampleDistance(
+            VOLUME_SAMPLE_CELLS * float(spacing[0])
+        )
 
         camera = cena.camera
         camera.focal_point = tuple(float(v) for v in focus)
@@ -2435,6 +2449,19 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
         opacity_function = volume_opacity_function(metadata["speed_range"])
         volume_actor.prop.SetScalarOpacity(opacity_function)
         volume_actor.prop.SetScalarOpacityUnitDistance(unit)
+
+        # O VTK amostra volume por vizinho mais próximo por padrão, e o
+        # PyVista não altera isso: cada voxel vira um cubo sólido. É daí
+        # que vinha a aparência de baixa resolução e a esfera facetada.
+        volume_actor.prop.SetInterpolationTypeToLinear()
+        volume_actor.mapper.SetAutoAdjustSampleDistances(False)
+        volume_actor.mapper.SetSampleDistance(
+            VOLUME_SAMPLE_CELLS * float(spacing[0])
+        )
+        print(
+            f"  interpolação {volume_actor.prop.GetInterpolationTypeAsString()}"
+            f" • passo do raio {VOLUME_SAMPLE_CELLS:g} célula"
+        )
         crossing = 2.0 * diameter / unit
         print(
             f"  volume: opacidade {VOLUME_MAX_OPACITY:g} por "
@@ -2502,6 +2529,8 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
         f"(nulo acima de |u| = {(1.0 - VOLUME_DEFICIT_FLOOR):.2f})",
         "escala invertida: MAIS CLARO = escoamento MAIS LENTO",
         "volume emissivo, sem iluminacao: a cor e o valor de |u|",
+        f"faixa de {VOLUME_SOLID_BAND_CELLS:g} celula junto a parede "
+        "excluida do volume (interface imersa borrada)",
     ]
     if metadata.get("wake_mode") == "reverse":
         notes.append("superficie ciano: bolha de recirculacao, u = 0")
