@@ -86,6 +86,16 @@ SLICE_SCALAR = "vorticity_magnitude"  # ou "velocity_magnitude"
 SLICE_COLORMAP = "magma"
 SLICE_PERCENTILE = 99.5  # topo da escala do corte, global e fixo
 SLICE_SAMPLES_PER_FRAME = 200_000
+# Fração da escala em que o corte sai de transparente para opaco. Sem isso o
+# plano vira um retângulo preto flutuando, com bordas duras, mais escuro que
+# o próprio fundo. Com a rampa, ele só existe onde há vorticidade.
+SLICE_FADE_FRACTION = 0.12
+
+# --- corpo imerso ------------------------------------------------------------
+# "analytic": desenha a esfera ajustada, se o ajuste for confirmado.
+# "contour": desenha sempre o contorno bruto de dwall_s = 0.
+SPHERE_MODE = "analytic"
+SPHERE_FIT_TOLERANCE = 0.35  # resíduo RMS máximo aceito, em células
 
 # --- streamlines -------------------------------------------------------------
 # Poucas linhas, semeadas junto ao corpo. Anéis largos a montante produzem
@@ -704,6 +714,27 @@ def sphere_surface(grid):
     return surface.clean() if surface is not None else None
 
 
+def fit_sphere(points):
+    """Ajuste de esfera por mínimos quadrados.
+
+    |p - c|² = r² é linear em (c, c·c - r²), então sai de um lstsq direto.
+    O resíduo devolvido é o teste: se o contorno de dwall_s = 0 realmente
+    descreve uma esfera, ele fica em fração de célula. Se não ficar, ou o
+    corpo não é esférico ou dwall_s está errado — e aí nada de esférico
+    deve ser desenhado.
+    """
+    matrix = np.hstack(
+        [2.0 * points, np.ones((len(points), 1))]
+    )
+    target = (points ** 2).sum(axis=1)
+    solution, *_ = np.linalg.lstsq(matrix, target, rcond=None)
+
+    center = solution[:3]
+    radius = float(np.sqrt(solution[3] + center @ center))
+    residual = np.linalg.norm(points - center, axis=1) - radius
+    return center, radius, residual
+
+
 def sphere_geometry(surface):
     """Centro e raio da esfera, usados para semear e enquadrar."""
     if surface is None:
@@ -719,6 +750,45 @@ def sphere_geometry(surface):
     )
     radius = 0.5 * max(xmax - xmin, ymax - ymin, zmax - zmin)
     return center, float(radius)
+
+
+def body_surface(contour):
+    """Geometria do corpo imerso, com o ajuste esférico validado.
+
+    O corpo imerso é dado de entrada da simulação, não resultado dela: sua
+    forma é conhecida exatamente. Quando o ajuste confirma que o contorno é
+    uma esfera dentro de uma fração de célula, desenhar a esfera analítica
+    representa o corpo melhor que o marching cubes de um campo de distância
+    interpolado — que produz facetas e depressões que não existem.
+    Se o ajuste não confirmar, devolve o contorno original.
+    """
+    if contour is None or not contour.n_points:
+        return None, None, None
+
+    center, radius, residual = fit_sphere(np.asarray(contour.points))
+    rms = float(np.sqrt(np.mean(residual ** 2)))
+    worst = float(np.abs(residual).max())
+    print(
+        f"  ajuste esférico: centro {np.round(center, 4)} • "
+        f"raio {radius:.5f} • resíduo RMS {rms / TARGET_DX:.3f} célula, "
+        f"máx {worst / TARGET_DX:.3f} célula"
+    )
+
+    if SPHERE_MODE == "contour" or rms > SPHERE_FIT_TOLERANCE * TARGET_DX:
+        if SPHERE_MODE != "contour":
+            print(
+                "  AVISO: resíduo acima da tolerância; usando o contorno "
+                "bruto de dwall_s = 0 em vez da esfera analítica."
+            )
+        return contour, center, radius
+
+    analytic = pv.Sphere(
+        radius=radius,
+        center=tuple(center),
+        theta_resolution=120,
+        phi_resolution=120,
+    )
+    return analytic, center, radius
 
 
 def seed_points(grid, center, radius):
@@ -801,16 +871,16 @@ def build_scene(cache_files: list[Path], force: bool = False):
     print(f"Geometria: {destination}")
 
     reference = pv.read(cache_files[len(cache_files) // 2])
-    sphere = sphere_surface(reference)
-    center, radius = sphere_geometry(sphere)
+    contour = sphere_surface(reference)
+    sphere, center, radius = body_surface(contour)
     if sphere is not None:
         sphere.save(destination / "sphere.vtp", binary=True)
         print(
-            f"  esfera: centro {np.round(center, 4)} • raio {radius:.4f} • "
-            f"{sphere.n_points:,} pontos"
+            f"  corpo: {sphere.n_points:,} pontos • "
+            f"{2.0 * radius / TARGET_DX:.1f} células no diâmetro"
         )
     else:
-        print("  esfera: não encontrada em dwall_s = 0")
+        print("  corpo: não encontrado em dwall_s = 0")
 
     slice_normal = (0.0, 1.0, 0.0)
     slice_origin = (
@@ -1038,7 +1108,7 @@ def inspect_cache(cache_files: list[Path]):
     estar associando células ao nível errado.
     """
     reference = pv.read(cache_files[len(cache_files) // 2])
-    center, radius = sphere_geometry(sphere_surface(reference))
+    _, center, radius = body_surface(sphere_surface(reference))
     if center is not None:
         print(
             f"Esfera: centro {np.round(center, 4)} • "
@@ -1210,6 +1280,17 @@ def view(metadata):
     slice_table.scalar_range = slice_range
     slice_table.nan_opacity = 0.0
 
+    # Rampa de opacidade: o plano desaparece onde não há vorticidade, em vez
+    # de recortar um retângulo escuro contra o fundo.
+    table_values = slice_table.values
+    ramp = np.clip(
+        np.linspace(0.0, 1.0, len(table_values)) / SLICE_FADE_FRACTION,
+        0.0,
+        1.0,
+    )
+    table_values[:, 3] = (ramp * 255).astype(np.uint8)
+    slice_table.values = table_values
+
     first = frames[0]
 
     # Campo escalar: opaco e sem iluminação, para que a cor represente
@@ -1352,11 +1433,17 @@ def view(metadata):
         else np.asarray(first["slice"].center)
     )
     length = first["slice"].length
-    plotter.camera_position = [
-        focus + np.asarray(CAMERA_DIRECTION) * length,
-        focus,
-        (0.0, 0.0, 1.0),
-    ]
+    # Atribuído campo a campo no objeto Camera. A forma em lista
+    # [posição, foco, viewup] não estava aplicando o viewup, e a cena vinha
+    # girada 90°: o escoamento descia a tela em vez de atravessá-la.
+    camera = plotter.camera
+    camera.focal_point = tuple(float(value) for value in focus)
+    camera.position = tuple(
+        float(value)
+        for value in focus + np.asarray(CAMERA_DIRECTION) * length
+    )
+    camera.up = (0.0, 0.0, 1.0)
+    plotter.reset_camera_clipping_range()
     plotter.camera.zoom(CAMERA_ZOOM)
 
     state = {"index": 0, "paused": False}
@@ -1439,7 +1526,7 @@ def resolve_output_dir(explicit: str | None) -> Path:
 
 def main():
     global OUTPUT_DIR, TARGET_DX, WAKE_MODE, Q_STAR_LEVEL, Q_MASK_DIAMETERS
-    global CROP_LEVEL, SHOW_STREAMLINES, SLICE_SCALAR
+    global CROP_LEVEL, SHOW_STREAMLINES, SLICE_SCALAR, SPHERE_MODE
 
     parser = argparse.ArgumentParser(
         description="Reconstrói AMR do MFSim e visualiza o escoamento."
@@ -1510,6 +1597,11 @@ def main():
         help=f"escalar do corte central (padrão: {SLICE_SCALAR})",
     )
     parser.add_argument(
+        "--sphere",
+        choices=("analytic", "contour"),
+        help=f"geometria do corpo imerso (padrão: {SPHERE_MODE})",
+    )
+    parser.add_argument(
         "--dx",
         type=float,
         help=f"espaçamento alvo (padrão: {TARGET_DX})",
@@ -1536,6 +1628,8 @@ def main():
         SHOW_STREAMLINES = False
     if args.slice_scalar is not None:
         SLICE_SCALAR = args.slice_scalar
+    if args.sphere is not None:
+        SPHERE_MODE = args.sphere
 
     selected = (
         args.preprocess or args.geometry or args.view or args.inspect
