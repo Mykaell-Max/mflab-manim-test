@@ -2074,6 +2074,149 @@ def prepare_lic(fields, spacing, slice_index, width):
     return samples, vorticities, height, width
 
 
+def diagnose_volume(cache_files: list[Path], metadata):
+    """Instrumenta o caminho de volume rendering, etapa por etapa.
+
+    A cadeia tem muitos pontos onde o volume some sem erro nenhum: dado sem
+    déficit, função de opacidade zerada, unidade de opacidade fora de
+    escala, mapper caindo em software, cor escura sobre fundo escuro. Este
+    modo mede cada elo em vez de supor.
+    """
+    print("\n===== 1. AMBIENTE =====")
+    plotter = pv.Plotter(off_screen=True, window_size=(600, 400))
+    plotter.set_background(BACKGROUND)
+    window = plotter.render_window
+    plotter.render()
+    print(f"  classe da render window : {window.GetClassName()}")
+    print(f"  suporta OpenGL          : {bool(window.SupportsOpenGL())}")
+    print(f"  render window direta    : {bool(window.IsDirect())}")
+    try:
+        print(f"  fabricante GL           : {window.ReportCapabilities()[:200]}")
+    except Exception as error:  # noqa: BLE001
+        print(f"  capacidades indisponíveis: {error}")
+
+    print("\n===== 2. DADO =====")
+    fields, speeds, times, origin, spacing = load_fields(cache_files[:1])
+    speed = speeds[0]
+    print(f"  shape {speed.shape} • dtype {speed.dtype}")
+    print(f"  |u| min {speed.min():.6f} • max {speed.max():.6f}")
+    percentis = [0.1, 1, 5, 25, 50, 75, 99]
+    valores = np.percentile(speed, percentis)
+    for p, v in zip(percentis, valores):
+        print(f"    percentil {p:>5}: |u| = {v:.6f}")
+    limite = 1.0 - VOLUME_DEFICIT_FLOOR
+    abaixo = int((speed < limite).sum())
+    print(
+        f"  pontos com |u| < {limite:.3f} (opacidade > 0): "
+        f"{abaixo:,} = {abaixo / speed.size * 100:.3f}% do volume"
+    )
+    if abaixo == 0:
+        print("  >>> FALHA AQUI: nenhum ponto opaco. O campo não tem déficit.")
+
+    print("\n===== 3. FUNCAO DE OPACIDADE =====")
+    clim = tuple(metadata["speed_range"])
+    function = volume_opacity_function(clim)
+    print(f"  clim = {clim}")
+    for probe in (0.0, 0.2, 0.5, 0.8, 0.9, 0.97, 1.0, 1.2):
+        print(f"    |u| = {probe:.2f} -> alfa {function.GetValue(probe):.6f}")
+    unit = VOLUME_UNIT_CELLS * float(spacing[0])
+    print(f"  unidade de opacidade: {unit:g} (dx = {spacing[0]:g})")
+
+    print("\n===== 4. RENDER =====")
+    grid = pv.ImageData(
+        dimensions=speed.shape,
+        spacing=tuple(float(v) for v in spacing),
+        origin=tuple(float(v) for v in origin),
+    )
+    grid.point_data["speed"] = speed.ravel(order="F")
+
+    diameter = 2.0 * float(metadata["sphere_radius"])
+    focus = np.asarray(metadata["sphere_center"]) + np.array(
+        [CAMERA_FOCUS_OFFSET_D * diameter, 0.0, 0.0]
+    )
+    background = np.array([7, 19, 31])
+    destination = video_directory()
+    destination.mkdir(parents=True, exist_ok=True)
+
+    ensaios = [
+        ("controle_opaco", None, 1.0, "viridis"),
+        ("atual", None, VOLUME_MAX_OPACITY, VOLUME_COLORMAP),
+        ("opacidade_4x", None, VOLUME_MAX_OPACITY * 4, VOLUME_COLORMAP),
+        ("opacidade_16x", None, VOLUME_MAX_OPACITY * 16, VOLUME_COLORMAP),
+    ]
+
+    for nome, _, opacidade, cmap in ensaios:
+        cena = pv.Plotter(off_screen=True, window_size=(800, 600))
+        cena.set_background(BACKGROUND)
+        cena.enable_parallel_projection()
+        actor = cena.add_volume(
+            grid,
+            scalars="speed",
+            cmap=cmap,
+            clim=clim,
+            shade=False,
+            ambient=1.0,
+            diffuse=0.0,
+            mapper="smart",
+            show_scalar_bar=False,
+        )
+
+        if nome == "controle_opaco":
+            # Controle: tudo opaco. Se nem isto aparecer, o problema está
+            # no mapper ou no contexto gráfico, não na transferência.
+            constante = vtk.vtkPiecewiseFunction()
+            constante.AddPoint(float(clim[0]), 1.0)
+            constante.AddPoint(float(clim[1]), 1.0)
+            actor.prop.SetScalarOpacity(constante)
+        else:
+            escala = opacidade / max(VOLUME_MAX_OPACITY, 1e-12)
+            valores, curva = volume_opacity_curve(clim)
+            ajustada = vtk.vtkPiecewiseFunction()
+            for v, a in zip(valores, np.clip(curva * escala, 0.0, 1.0)):
+                ajustada.AddPoint(float(v), float(a))
+            actor.prop.SetScalarOpacity(ajustada)
+        actor.prop.SetScalarOpacityUnitDistance(unit)
+
+        camera = cena.camera
+        camera.focal_point = tuple(float(v) for v in focus)
+        camera.position = tuple(
+            float(v)
+            for v in focus + np.asarray(CAMERA_DIRECTION) * 0.5
+        )
+        camera.up = (0.0, 0.0, 1.0)
+        camera.parallel_scale = 0.5 * CAMERA_FRAME_DIAMETERS * diameter
+        cena.reset_camera_clipping_range()
+
+        mapper_class = actor.mapper.GetClassName()
+        cena.render()
+        image = cena.screenshot(
+            str(destination / f"diag_{nome}.png"), return_img=True
+        )
+        cena.close()
+
+        difference = np.abs(
+            image[..., :3].astype(int) - background
+        ).sum(axis=-1)
+        visible = difference > 25
+        share = visible.mean() * 100
+        brightness = (
+            image[visible][:, :3].mean() if visible.any() else 0.0
+        )
+        print(
+            f"  {nome:<16} opacidade={opacidade:<7.4g} cmap={cmap:<10} "
+            f"mapper={mapper_class:<28} pixels={share:5.1f}% "
+            f"brilho={brightness:6.1f}"
+        )
+
+    plotter.close()
+    print(f"\n  PNGs de diagnóstico em {destination}/diag_*.png")
+    print(
+        "\n  LEITURA: se 'controle_opaco' der ~0% de pixels, o volume não "
+        "está sendo renderizado (mapper/contexto). Se o controle aparecer "
+        "mas 'atual' não, o problema é a função de opacidade ou a cor."
+    )
+
+
 def render_video(cache_files: list[Path], metadata, preview: int | None):
     destination = video_directory()
     destination.mkdir(parents=True, exist_ok=True)
@@ -2564,6 +2707,11 @@ def main():
         help="desliga o volume rendering do campo de velocidade",
     )
     parser.add_argument(
+        "--diagnose-volume",
+        action="store_true",
+        help="instrumenta o caminho de volume rendering e grava PNGs",
+    )
+    parser.add_argument(
         "--no-smoothing",
         action="store_true",
         help="não casa a suavização ao nível AMR (mostra os blocos)",
@@ -2676,6 +2824,7 @@ def main():
         or args.geometry
         or args.view
         or args.inspect
+        or args.diagnose_volume
         or render_video_requested
     )
     run_preprocess = args.preprocess or not selected
@@ -2704,6 +2853,9 @@ def main():
 
     if run_geometry:
         build_scene(select(discover_cache_files()), force=args.force)
+
+    if args.diagnose_volume:
+        diagnose_volume(select(discover_cache_files()), load_scene())
 
     if render_video_requested:
         render_video(
