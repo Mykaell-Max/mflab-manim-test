@@ -196,7 +196,10 @@ LEVEL_MATCHED_SMOOTHING = True
 # O LIC é um corte central, não um volume. Funciona bem nos presets atuais,
 # que permanecem majoritariamente laterais, e pode ser ligado com --lic.
 SHOW_LIC = False
-LIC_WIDTH = 1024
+# A textura é vista em um vídeo de 1920 px e, nos closes, ocupa boa parte do
+# quadro. Gerar só 1024 px deixava os texels visíveis. A filtragem linear e
+# mipmaps abaixo cuidam da redução quando o plano aparece oblíquo.
+LIC_WIDTH = 1920
 LIC_STEPS = 48
 LIC_CYCLES = 3.0  # listras por janela de convolução
 LIC_TURNS_PER_SECOND = 0.55
@@ -204,7 +207,9 @@ LIC_TURNS_PER_SECOND = 0.55
 # corrente e colorida pela mesma escala de |u| do volume. A vorticidade
 # controla apenas o alfa, fazendo o plano desaparecer fora da esteira.
 LIC_CONTRAST = 0.48  # quanto a textura modula a luminância da cor
-LIC_MAX_OPACITY = 0.60
+# O LIC é só uma pista de direção dentro do volume, não a camada principal.
+# Alfa alto transformava o corte central numa parede 2-D opaca.
+LIC_MAX_OPACITY = 0.25
 LIC_FLIP_V = False  # inverta se a textura sair espelhada na vertical
 
 CAMERA_ORBIT_DEGREES = 16.0
@@ -232,15 +237,15 @@ CINEMATIC_CAMERA_KEYFRAMES = (
     {
         "at": 0.43,
         "direction": (-0.08, -1.00, 0.12),
-        "focus_d": 3.8,
-        "frame_d": 3.4,
-        "distance_d": 9.5,
+        "focus_d": 2.6,
+        "frame_d": 4.4,
+        "distance_d": 10.0,
     },
     {
         "at": 0.68,
         "direction": (0.48, -0.78, 0.46),
-        "focus_d": 3.1,
-        "frame_d": 4.1,
+        "focus_d": 2.7,
+        "frame_d": 4.5,
         "distance_d": 10.5,
     },
     {
@@ -2450,7 +2455,19 @@ def apply_video_camera(camera, center, diameter, fraction):
     camera.focal_point = tuple(float(value) for value in focus)
     camera.position = tuple(float(value) for value in position)
     camera.up = (0.0, 0.0, 1.0)
-    camera.parallel_scale = 0.5 * state["frame_d"] * diameter
+    if CAMERA_MOTION == "cinematic":
+        # Perspectiva fornece paralaxe e variação aparente de profundidade.
+        # O ângulo é derivado do enquadramento desejado, então a troca de
+        # projeção não altera quanto da cena cabe verticalmente no quadro.
+        camera.SetParallelProjection(False)
+        half_angle = np.arctan2(
+            0.5 * state["frame_d"], state["distance_d"]
+        )
+        camera.SetViewAngle(float(np.degrees(2.0 * half_angle)))
+    else:
+        # Presets de inspeção/comparação continuam ortográficos.
+        camera.SetParallelProjection(True)
+        camera.parallel_scale = 0.5 * state["frame_d"] * diameter
 
 
 def render_video(cache_files: list[Path], metadata, preview: int | None):
@@ -2541,7 +2558,8 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
 
     plotter = pv.Plotter(off_screen=True, window_size=list(VIDEO_SIZE))
     plotter.set_background(BACKGROUND)
-    plotter.enable_parallel_projection()
+    if CAMERA_MOTION != "cinematic":
+        plotter.enable_parallel_projection()
 
     plane = pv.PolyData(
         np.array(
@@ -2742,6 +2760,11 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
             "alfa controlado pela vorticidade"
         )
     notes.append(f"movimento de camera: {CAMERA_MOTION}")
+    notes.append(
+        "projecao: perspectiva (profundidade visual)"
+        if CAMERA_MOTION == "cinematic"
+        else "projecao: paralela (comparacao geometrica)"
+    )
     plotter.add_text(
         "\n".join(notes),
         position="lower_right",
@@ -2863,6 +2886,11 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
             if LIC_FLIP_V:
                 image = image[::-1]
             texture = pv.Texture(np.ascontiguousarray(image))
+            # LIC é um campo contínuo. O padrão do VTK deixa os texels
+            # aparentes quando o plano se aproxima ou fica oblíquo.
+            texture.interpolate = True
+            texture.mipmap = True
+            texture.SetMaximumAnisotropicFiltering(8.0)
             texture.Modified()
             plane_actor.SetTexture(texture)
             plane_actor.Modified()
