@@ -125,7 +125,10 @@ ENABLE_SSAO = True
 # frames de dado são quase idênticos. O movimento do vídeo vem das partículas
 # advectadas e da textura LIC, não da mudança do campo.
 VIDEO_FPS = 60
-VIDEO_SECONDS = 20.0
+# O intervalo físico disponível neste caso é curto. Espalhá-lo por 20 s
+# deixava tanto a evolução do campo quanto a órbita da câmera excessivamente
+# lentas. O fps controla a suavidade; esta duração controla o ritmo.
+VIDEO_SECONDS = 8.0
 VIDEO_SIZE = (1920, 1080)
 
 # Partículas são elemento cosmético: ajudam a ler movimento, mas competem
@@ -162,7 +165,11 @@ VOLUME_GAMMA = 1.35
 # isso faz um raio cruzar a esteira inteira acumulando ~2% de opacidade, e o
 # volume some. Amarrar a unidade ao dx torna o valor previsível: atravessar
 # N células acumula 1 - (1 - opacidade)^N.
-VOLUME_MAX_OPACITY = 0.20
+# A opacidade se acumula ao longo do raio. Em dx=0.002, 0.20 por célula
+# tornava o núcleo da esteira praticamente opaco e escondia a superfície de
+# Q/recirculação contida nele. 0.035 ainda dá corpo ao déficit de velocidade,
+# mas preserva a leitura das estruturas internas.
+VOLUME_MAX_OPACITY = 0.035
 VOLUME_UNIT_CELLS = 1.0
 # Passo do raio em células. Menor que 1 integra mais fino e suaviza a
 # renderização; o custo é linear e o render é offline.
@@ -203,6 +210,7 @@ TEXT_COLOR = "#F1F6F9"
 # fundem numa massa só e o corpo parece deformado.
 GEOMETRY_COLOR = "#9AA6AE"
 WAKE_COLOR = "#37D6E8"
+WAKE_OPACITY = 1.0
 TRACER_COLOR = "#E8F4FF"
 COLORMAP = "viridis"
 
@@ -2410,9 +2418,12 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
             scene_directory() / f"wake.{timestep_number(cache_files[0]):09d}.vtp"
         ),
         color=WAKE_COLOR,
-        opacity=0.80,
+        opacity=WAKE_OPACITY,
         smooth_shading=True,
-        specular=0.25,
+        ambient=0.30,
+        diffuse=0.80,
+        specular=0.20,
+        specular_power=15,
         show_scalar_bar=False,
         reset_camera=False,
     )
@@ -2550,6 +2561,7 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
         f"(nulo acima de |u| = {(1.0 - VOLUME_DEFICIT_FLOOR):.2f})",
         "escala invertida: MAIS CLARO = escoamento MAIS LENTO",
         "volume emissivo, sem iluminacao: a cor e o valor de |u|",
+        f"opacidade maxima do volume: {VOLUME_MAX_OPACITY:g} por celula",
         f"faixa de {VOLUME_SOLID_BAND_CELLS:g} celula junto a parede "
         "excluida do volume (interface imersa borrada)",
     ]
@@ -2747,7 +2759,7 @@ def main():
     global OUTPUT_DIR, TARGET_DX, WAKE_MODE, Q_STAR_LEVEL, Q_MASK_DIAMETERS
     global CROP_LEVEL, SHOW_STREAMLINES, SLICE_SCALAR, SPHERE_MODE
     global SHOW_LIC, VIDEO_SECONDS, SHOW_VOLUME, LEVEL_MATCHED_SMOOTHING
-    global SHOW_PARTICLES
+    global SHOW_PARTICLES, VOLUME_MAX_OPACITY, WAKE_OPACITY
 
     parser = argparse.ArgumentParser(
         description="Reconstrói AMR do MFSim e visualiza o escoamento."
@@ -2815,6 +2827,24 @@ def main():
         help=(
             "duração do vídeo em segundos "
             f"(padrão: {VIDEO_SECONDS:g}); use um valor curto para testar"
+        ),
+    )
+    parser.add_argument(
+        "--volume-opacity",
+        type=float,
+        metavar="ALPHA",
+        help=(
+            "opacidade máxima do volume por célula, entre 0 e 1 "
+            f"(padrão: {VOLUME_MAX_OPACITY:g})"
+        ),
+    )
+    parser.add_argument(
+        "--wake-opacity",
+        type=float,
+        metavar="ALPHA",
+        help=(
+            "opacidade da superfície de Q/recirculação, entre 0 e 1 "
+            f"(padrão: {WAKE_OPACITY:g})"
         ),
     )
     parser.add_argument(
@@ -2909,7 +2939,17 @@ def main():
     if args.no_smoothing:
         LEVEL_MATCHED_SMOOTHING = False
     if args.seconds is not None:
+        if args.seconds <= 0.0:
+            parser.error("--seconds deve ser maior que zero")
         VIDEO_SECONDS = args.seconds
+    if args.volume_opacity is not None:
+        if not 0.0 <= args.volume_opacity <= 1.0:
+            parser.error("--volume-opacity deve estar entre 0 e 1")
+        VOLUME_MAX_OPACITY = args.volume_opacity
+    if args.wake_opacity is not None:
+        if not 0.0 <= args.wake_opacity <= 1.0:
+            parser.error("--wake-opacity deve estar entre 0 e 1")
+        WAKE_OPACITY = args.wake_opacity
 
     render_video_requested = args.render or args.preview is not None
     selected = (
