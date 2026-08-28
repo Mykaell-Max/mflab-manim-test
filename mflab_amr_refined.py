@@ -212,6 +212,17 @@ FLOW_TEXTURE_DISPLAY_MAX = 0.50
 FLOW_TEXTURE_MAX_OPACITY = 0.010
 FLOW_TEXTURE_COLORMAP = "magma"
 
+# Segundo volume científico: vorticidade adimensional |ω|D/U. A velocidade
+# continua como envelope quente; a vorticidade usa uma paleta fria e uma
+# transferência seletiva para revelar rotação sem virar uma névoa uniforme.
+SHOW_VORTICITY_VOLUME = False
+VORTICITY_VOLUME_COLORMAP = "winter"
+VORTICITY_VOLUME_MAX_OPACITY = 0.016
+VORTICITY_VOLUME_PERCENTILE = 99.5
+VORTICITY_VOLUME_ONSET_FRACTION = 0.10
+VORTICITY_VOLUME_MID_FRACTION = 0.35
+VORTICITY_VOLUME_MASK_D = 0.05
+
 # Suavização casada ao nível AMR: cada região é borrada até o dx nativo do
 # nível que prevaleceu ali. Não é maquiagem — é remover detalhe que a
 # interpolação inventou. Sem isso o nível 0 (dx 0.032 amostrado a 0.002)
@@ -1664,6 +1675,91 @@ def flow_visibility_masks(
     return masks
 
 
+def vorticity_volume_fields(
+    fields,
+    origin,
+    spacing,
+    points,
+    shape,
+    auxiliary_spacing,
+    center,
+    diameter,
+):
+    """Calcula |ω|D/U numa grade 3-D auxiliar isotrópica."""
+    radius = 0.5 * diameter
+    distance = np.linalg.norm(points - center, axis=1).reshape(
+        shape, order="F"
+    )
+    excluded = distance < radius + VORTICITY_VOLUME_MASK_D * diameter
+    blocks = []
+    samples = []
+    generator = np.random.default_rng(314159)
+
+    for index, field in enumerate(fields, start=1):
+        sampled = sample_vectors(field, origin, spacing, points)
+        velocity = np.stack(
+            [
+                sampled[:, axis].reshape(shape, order="F")
+                for axis in range(3)
+            ],
+            axis=-1,
+        )
+        del sampled
+
+        omega_squared = np.zeros(shape, dtype=np.float32)
+        derivative_a = np.gradient(
+            velocity[..., 2], float(auxiliary_spacing[1]), axis=1
+        )
+        derivative_b = np.gradient(
+            velocity[..., 1], float(auxiliary_spacing[2]), axis=2
+        )
+        omega_squared += (derivative_a - derivative_b) ** 2
+        del derivative_a, derivative_b
+
+        derivative_a = np.gradient(
+            velocity[..., 0], float(auxiliary_spacing[2]), axis=2
+        )
+        derivative_b = np.gradient(
+            velocity[..., 2], float(auxiliary_spacing[0]), axis=0
+        )
+        omega_squared += (derivative_a - derivative_b) ** 2
+        del derivative_a, derivative_b
+
+        derivative_a = np.gradient(
+            velocity[..., 1], float(auxiliary_spacing[0]), axis=0
+        )
+        derivative_b = np.gradient(
+            velocity[..., 0], float(auxiliary_spacing[1]), axis=1
+        )
+        omega_squared += (derivative_a - derivative_b) ** 2
+        del derivative_a, derivative_b, velocity
+
+        omega_star = (
+            np.sqrt(omega_squared) * diameter / REFERENCE_VELOCITY
+        ).astype(np.float32)
+        omega_star[excluded] = 0.0
+        blocks.append(omega_star)
+
+        positive = omega_star[omega_star > 0.0]
+        if positive.size:
+            count = min(200_000, positive.size)
+            samples.append(generator.choice(positive, count, replace=False))
+        print(
+            f"    vorticidade 3-D {index}/{len(fields)} • "
+            f"omega* max {float(omega_star.max()):.4g}",
+            flush=True,
+        )
+
+    if not samples:
+        return blocks, (0.0, 1.0)
+    maximum = float(
+        np.percentile(
+            np.concatenate(samples), VORTICITY_VOLUME_PERCENTILE
+        )
+    )
+    return blocks, (0.0, max(maximum, 1.0e-12))
+
+
 def flow_texture_density(positions, weights, bounds, shape, visibility):
     """Partículas invisíveis -> densidade volumétrica suave e mascarada."""
     edges = (
@@ -2178,6 +2274,20 @@ def flow_texture_opacity_function():
     function.AddPoint(0.18, 0.35 * FLOW_TEXTURE_MAX_OPACITY)
     function.AddPoint(FLOW_TEXTURE_DISPLAY_MAX, FLOW_TEXTURE_MAX_OPACITY)
     function.AddPoint(1.00, FLOW_TEXTURE_MAX_OPACITY)
+    return function
+
+
+def vorticity_volume_opacity_function(scalar_range):
+    """Transferência seletiva para o volume de |ω|D/U."""
+    maximum = float(scalar_range[1])
+    function = vtk.vtkPiecewiseFunction()
+    function.AddPoint(0.0, 0.0)
+    function.AddPoint(VORTICITY_VOLUME_ONSET_FRACTION * maximum, 0.0)
+    function.AddPoint(
+        VORTICITY_VOLUME_MID_FRACTION * maximum,
+        0.30 * VORTICITY_VOLUME_MAX_OPACITY,
+    )
+    function.AddPoint(maximum, VORTICITY_VOLUME_MAX_OPACITY)
     return function
 
 
@@ -2699,8 +2809,9 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
 
     flow_shape = flow_origin = flow_spacing = flow_masks = None
     flow_positions = flow_ages = flow_weights = None
+    vorticity_blocks = vorticity_range = None
     flow_lifetime_frames = FLOW_TEXTURE_LIFETIME_SECONDS * VIDEO_FPS
-    if SHOW_FLOW_TEXTURE:
+    if SHOW_FLOW_TEXTURE or SHOW_VORTICITY_VOLUME:
         (
             flow_shape,
             flow_origin,
@@ -2708,8 +2819,13 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
             flow_points,
         ) = flow_texture_geometry(bounds)
         print(
+            "Grade volumétrica auxiliar: "
+            f"{flow_shape[0]}x{flow_shape[1]}x{flow_shape[2]}"
+        )
+
+    if SHOW_FLOW_TEXTURE:
+        print(
             "Preparando textura volumétrica: "
-            f"grade {flow_shape[0]}x{flow_shape[1]}x{flow_shape[2]} • "
             f"{FLOW_TEXTURE_PARTICLES:,} partículas invisíveis"
         )
         flow_masks = flow_visibility_masks(
@@ -2736,6 +2852,24 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
         flow_weights = generator.uniform(
             0.35, 1.0, FLOW_TEXTURE_PARTICLES
         ).astype(np.float32)
+
+    if SHOW_VORTICITY_VOLUME:
+        print("Calculando volume de vorticidade normalizada...")
+        vorticity_blocks, vorticity_range = vorticity_volume_fields(
+            fields,
+            origin,
+            spacing,
+            flow_points,
+            flow_shape,
+            flow_spacing,
+            center,
+            diameter,
+        )
+        print(
+            f"  escala global omega* = |omega|D/U: 0 a "
+            f"{vorticity_range[1]:.4g} "
+            f"(percentil {VORTICITY_VOLUME_PERCENTILE:g})"
+        )
 
     plotter = pv.Plotter(off_screen=True, window_size=list(VIDEO_SIZE))
     plotter.set_background(BACKGROUND)
@@ -2908,6 +3042,59 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
             f"opacidade máxima {FLOW_TEXTURE_MAX_OPACITY:g} por célula"
         )
 
+    vorticity_dataset = None
+    if SHOW_VORTICITY_VOLUME:
+        vorticity_grid = pv.ImageData(
+            dimensions=flow_shape,
+            spacing=tuple(float(value) for value in flow_spacing),
+            origin=tuple(float(value) for value in flow_origin),
+        )
+        vorticity_grid.point_data["omega_star"] = vorticity_blocks[0].ravel(
+            order="F"
+        )
+        vorticity_actor = plotter.add_volume(
+            vorticity_grid,
+            scalars="omega_star",
+            cmap=VORTICITY_VOLUME_COLORMAP,
+            clim=vorticity_range,
+            shade=False,
+            ambient=1.0,
+            diffuse=0.0,
+            specular=0.0,
+            mapper="smart",
+            reset_camera=False,
+            show_scalar_bar=True,
+            scalar_bar_args={
+                "title": "|omega| D/U",
+                "n_labels": 5,
+                "fmt": "%.2f",
+                "color": TEXT_COLOR,
+                "position_x": 0.84,
+                "position_y": 0.16,
+                "width": 0.025,
+                "height": 0.62,
+                "vertical": True,
+            },
+        )
+        vorticity_opacity = vorticity_volume_opacity_function(
+            vorticity_range
+        )
+        vorticity_actor.prop.SetScalarOpacity(vorticity_opacity)
+        vorticity_actor.prop.SetScalarOpacityUnitDistance(
+            float(np.min(flow_spacing))
+        )
+        vorticity_actor.prop.SetInterpolationTypeToLinear()
+        vorticity_actor.mapper.SetAutoAdjustSampleDistances(False)
+        vorticity_actor.mapper.SetSampleDistance(
+            0.65 * float(np.min(flow_spacing))
+        )
+        vorticity_dataset = vorticity_actor.mapper.dataset
+        print(
+            "  volume de vorticidade: paleta "
+            f"{VORTICITY_VOLUME_COLORMAP} • opacidade máxima "
+            f"{VORTICITY_VOLUME_MAX_OPACITY:g} por célula"
+        )
+
     tracers = pv.PolyData()
     tracers.points = history.reshape(-1, 3)
     tracers.lines = connectivity
@@ -2936,7 +3123,9 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
     # pixels contra 9% sem anti-aliasing. O passe de volume não sobrevive ao
     # render em resolução ampliada. FXAA é pós-processo e convive.
     antialiasing = (
-        "fxaa" if SHOW_VOLUME or SHOW_FLOW_TEXTURE else "ssaa"
+        "fxaa"
+        if SHOW_VOLUME or SHOW_FLOW_TEXTURE or SHOW_VORTICITY_VOLUME
+        else "ssaa"
     )
     try:
         plotter.enable_anti_aliasing(antialiasing)
@@ -2994,6 +3183,15 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
         notes.append(
             f"textura cresce de 0 a 100% nos primeiros "
             f"{FLOW_TEXTURE_FADE_DOWNSTREAM_D:g} D apos o corpo"
+        )
+    if SHOW_VORTICITY_VOLUME:
+        notes.append(
+            f"volume frio: |omega|D/U, escala 0 a "
+            f"{vorticity_range[1]:.3g} fixa entre frames"
+        )
+        notes.append(
+            f"vorticidade excluida ate {VORTICITY_VOLUME_MASK_D:g} D "
+            "da superficie (interface imersa)"
         )
     notes.append(f"movimento de camera: {CAMERA_MOTION}")
     notes.append(
@@ -3109,6 +3307,12 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
                 )
                 volume_dataset.Modified()
                 volume_actor.mapper.Modified()
+            if vorticity_dataset is not None:
+                vorticity_dataset.point_data["omega_star"] = (
+                    vorticity_blocks[nearest].ravel(order="F")
+                )
+                vorticity_dataset.Modified()
+                vorticity_actor.mapper.Modified()
             if wake_actor is not None:
                 wake_actor.mapper.SetInputData(
                     read_optional(
@@ -3218,6 +3422,7 @@ def main():
     global SHOW_PARTICLES, VOLUME_MAX_OPACITY, WAKE_OPACITY, SHOW_WAKE
     global VOLUME_COLORMAP, CAMERA_MOTION, LIC_MAX_OPACITY, LIC_CONTRAST
     global SHOW_FLOW_TEXTURE, FLOW_TEXTURE_MAX_OPACITY
+    global SHOW_VORTICITY_VOLUME, VORTICITY_VOLUME_MAX_OPACITY
 
     parser = argparse.ArgumentParser(
         description="Reconstrói AMR do MFSim e visualiza o escoamento."
@@ -3297,6 +3502,20 @@ def main():
         help=(
             "opacidade máxima por célula da textura 3-D, entre 0 e 1 "
             f"(padrão: {FLOW_TEXTURE_MAX_OPACITY:g})"
+        ),
+    )
+    parser.add_argument(
+        "--vorticity-volume",
+        action="store_true",
+        help="sobrepõe o volume 3-D de vorticidade |omega|D/U",
+    )
+    parser.add_argument(
+        "--vorticity-opacity",
+        type=float,
+        metavar="ALPHA",
+        help=(
+            "opacidade máxima por célula do volume de vorticidade "
+            f"(padrão: {VORTICITY_VOLUME_MAX_OPACITY:g})"
         ),
     )
     parser.add_argument(
@@ -3463,6 +3682,12 @@ def main():
         if not 0.0 <= args.flow_texture_opacity <= 1.0:
             parser.error("--flow-texture-opacity deve estar entre 0 e 1")
         FLOW_TEXTURE_MAX_OPACITY = args.flow_texture_opacity
+    if args.vorticity_volume:
+        SHOW_VORTICITY_VOLUME = True
+    if args.vorticity_opacity is not None:
+        if not 0.0 <= args.vorticity_opacity <= 1.0:
+            parser.error("--vorticity-opacity deve estar entre 0 e 1")
+        VORTICITY_VOLUME_MAX_OPACITY = args.vorticity_opacity
     if args.no_volume:
         SHOW_VOLUME = False
     if args.no_smoothing:
