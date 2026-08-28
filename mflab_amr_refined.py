@@ -196,15 +196,20 @@ FLOW_TEXTURE_PARTICLES = 50_000
 FLOW_TEXTURE_GRID_X = 160
 FLOW_TEXTURE_SEED_RADII = 1.8
 FLOW_TEXTURE_LIFETIME_SECONDS = 6.0
-FLOW_TEXTURE_SMOOTH_CELLS = 1.15
-FLOW_TEXTURE_FLOOR_PERCENTILE = 60.0
+# Mais suave ao longo de x, direção predominante do escoamento: concentrações
+# viram filamentos largos em vez de blobs aproximadamente esféricos.
+FLOW_TEXTURE_SMOOTH_SIGMA = (2.2, 1.0, 1.0)
+FLOW_TEXTURE_FLOOR_PERCENTILE = 45.0
 FLOW_TEXTURE_PERCENTILE = 99.0
 FLOW_TEXTURE_GAMMA = 0.85
+# A textura começa nula no polo traseiro e chega à intensidade plena depois
+# desta distância. A bolha de recirculação próxima ao corpo fica desobstruída.
+FLOW_TEXTURE_FADE_DOWNSTREAM_D = 0.65
 # A máscara de déficit reduz a densidade final para aproximadamente 0 a 0.5
 # neste caso. A transferência satura nessa faixa, em vez de esperar um valor
 # 1.0 que nunca ocorria. Continua zerada fora do volume principal.
 FLOW_TEXTURE_DISPLAY_MAX = 0.50
-FLOW_TEXTURE_MAX_OPACITY = 0.018
+FLOW_TEXTURE_MAX_OPACITY = 0.010
 FLOW_TEXTURE_COLORMAP = "magma"
 
 # Suavização casada ao nível AMR: cada região é borrada até o dx nativo do
@@ -1628,8 +1633,17 @@ def flow_texture_geometry(bounds):
     return shape, origin, spacing, points
 
 
-def flow_visibility_masks(speeds, origin, spacing, points, shape):
+def flow_visibility_masks(
+    speeds, origin, spacing, points, shape, center, diameter
+):
     """Máscara 3-D que proíbe a textura fora do volume de velocidade."""
+    rear = float(center[0]) + 0.5 * diameter
+    streamwise_fade = np.clip(
+        (points[:, 0] - rear)
+        / max(FLOW_TEXTURE_FADE_DOWNSTREAM_D * diameter, 1.0e-12),
+        0.0,
+        1.0,
+    ).reshape(shape, order="F")
     masks = []
     for speed in speeds:
         sampled = sample_scalar(speed, origin, spacing, points).reshape(
@@ -1642,7 +1656,11 @@ def flow_visibility_masks(speeds, origin, spacing, points, shape):
             0.0,
             1.0,
         )
-        masks.append((normalized ** VOLUME_GAMMA).astype(np.float32))
+        masks.append(
+            (
+                normalized ** VOLUME_GAMMA * streamwise_fade
+            ).astype(np.float32)
+        )
     return masks
 
 
@@ -1655,7 +1673,7 @@ def flow_texture_density(positions, weights, bounds, shape, visibility):
     )
     density = np.histogramdd(positions, bins=edges, weights=weights)[0]
     density = gaussian_filter(
-        density.astype(np.float32), FLOW_TEXTURE_SMOOTH_CELLS
+        density.astype(np.float32), FLOW_TEXTURE_SMOOTH_SIGMA
     )
     positive = density[density > 0.0]
     if positive.size:
@@ -1664,7 +1682,7 @@ def flow_texture_density(positions, weights, bounds, shape, visibility):
         )
         ceiling = float(np.percentile(positive, FLOW_TEXTURE_PERCENTILE))
         # Remove o fundo quase uniforme da nuvem. Só as concentrações acima
-        # do percentil 60 viram filamentos; isso cria contraste sem aumentar
+        # do percentil 45 viram filamentos; isso cria contraste sem aumentar
         # a extensão espacial da camada.
         density = np.clip(
             (density - floor) / max(ceiling - floor, 1.0e-12),
@@ -2695,7 +2713,13 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
             f"{FLOW_TEXTURE_PARTICLES:,} partículas invisíveis"
         )
         flow_masks = flow_visibility_masks(
-            speeds, origin, spacing, flow_points, flow_shape
+            speeds,
+            origin,
+            spacing,
+            flow_points,
+            flow_shape,
+            center,
+            diameter,
         )
         flow_seed_radius = FLOW_TEXTURE_SEED_RADII * diameter
         flow_positions = spawn_positions(
@@ -2966,6 +2990,10 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
         notes.append(
             "textura 3-D: densidade de tracador passivo, invisivel fora "
             "do volume de deficit"
+        )
+        notes.append(
+            f"textura cresce de 0 a 100% nos primeiros "
+            f"{FLOW_TEXTURE_FADE_DOWNSTREAM_D:g} D apos o corpo"
         )
     notes.append(f"movimento de camera: {CAMERA_MOTION}")
     notes.append(
