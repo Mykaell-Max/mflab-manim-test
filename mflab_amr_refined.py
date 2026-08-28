@@ -117,6 +117,7 @@ CAMERA_DIRECTION = (-0.25, -1.00, 0.32)
 # caixa toda deixa o objeto perdido no meio da tela.
 CAMERA_FRAME_DIAMETERS = 5.5
 CAMERA_FOCUS_OFFSET_D = 2.5
+CAMERA_DISTANCE_DIAMETERS = 12.0
 WINDOW_SIZE = (1600, 900)
 ENABLE_SSAO = True
 
@@ -179,11 +180,12 @@ VOLUME_SAMPLE_CELLS = 0.5
 # fluido, não medida. Sem excluir, essa casca aparece como uma bola de
 # voxels grudada na esfera.
 VOLUME_SOLID_BAND_CELLS = 1.5
-# Colormap invertido de propósito. O que se exibe é a região LENTA; numa
-# escala convencional ela cai no extremo escuro e desaparece contra o fundo.
-# Invertida, o núcleo lento é o mais claro e o escoamento livre — que já é
-# transparente — seria o escuro. A barra de escala declara o sentido.
-VOLUME_COLORMAP = "magma_r"
+# Cividis é perceptualmente uniforme e legível para as formas mais comuns de
+# daltonismo. A inversão é intencional: o núcleo lento fica claro e o
+# escoamento livre, que já é transparente, ocupa o extremo escuro. A barra
+# continua exibindo os valores físicos de |u| em escala linear e fixa.
+VOLUME_COLORMAP = "cividis_r"
+VOLUME_COLORMAPS = ("cividis_r", "viridis_r", "magma_r", "inferno_r")
 
 # Suavização casada ao nível AMR: cada região é borrada até o dx nativo do
 # nível que prevaleceu ali. Não é maquiagem — é remover detalhe que a
@@ -202,6 +204,56 @@ LIC_CONTRAST = 0.65  # quanto a textura modula a cor do campo
 LIC_FLIP_V = False  # inverta se a textura sair espelhada na vertical
 
 CAMERA_ORBIT_DEGREES = 16.0
+CAMERA_MOTION = "cinematic"
+CAMERA_MOTIONS = ("cinematic", "orbit", "static")
+
+# Sequência normalizada e independente da resolução. direction aponta do
+# foco para a câmera; focus_d, frame_d e distance_d são medidos em diâmetros
+# da esfera. Primeiro e último estados são iguais para permitir loop suave.
+CINEMATIC_CAMERA_KEYFRAMES = (
+    {
+        "at": 0.00,
+        "direction": (-0.25, -1.00, 0.32),
+        "focus_d": 2.5,
+        "frame_d": 5.5,
+        "distance_d": 12.0,
+    },
+    {
+        "at": 0.20,
+        "direction": (-0.68, -0.72, 0.22),
+        "focus_d": 2.4,
+        "frame_d": 4.7,
+        "distance_d": 11.0,
+    },
+    {
+        "at": 0.43,
+        "direction": (-0.08, -1.00, 0.12),
+        "focus_d": 3.8,
+        "frame_d": 3.4,
+        "distance_d": 9.5,
+    },
+    {
+        "at": 0.68,
+        "direction": (0.48, -0.78, 0.46),
+        "focus_d": 3.1,
+        "frame_d": 4.1,
+        "distance_d": 10.5,
+    },
+    {
+        "at": 0.84,
+        "direction": (0.08, -1.00, 0.26),
+        "focus_d": 2.7,
+        "frame_d": 5.0,
+        "distance_d": 11.5,
+    },
+    {
+        "at": 1.00,
+        "direction": (-0.25, -1.00, 0.32),
+        "focus_d": 2.5,
+        "frame_d": 5.5,
+        "distance_d": 12.0,
+    },
+)
 
 BACKGROUND = "#07131F"
 TEXT_COLOR = "#F1F6F9"
@@ -2291,6 +2343,89 @@ def diagnose_volume(cache_files: list[Path], metadata):
     )
 
 
+def eased_camera_blend(value: float) -> float:
+    """Smoothstep: chega aos enquadramentos sem trancos de velocidade."""
+    value = float(np.clip(value, 0.0, 1.0))
+    return value * value * (3.0 - 2.0 * value)
+
+
+def cinematic_camera_state(fraction: float):
+    """Interpola a sequência cinematográfica em unidades de diâmetro."""
+    fraction = float(np.clip(fraction, 0.0, 1.0))
+    times = np.asarray(
+        [keyframe["at"] for keyframe in CINEMATIC_CAMERA_KEYFRAMES]
+    )
+    upper = int(
+        np.clip(
+            np.searchsorted(times, fraction, side="right"),
+            1,
+            len(CINEMATIC_CAMERA_KEYFRAMES) - 1,
+        )
+    )
+    lower = upper - 1
+    start = CINEMATIC_CAMERA_KEYFRAMES[lower]
+    end = CINEMATIC_CAMERA_KEYFRAMES[upper]
+    span = float(end["at"] - start["at"])
+    blend = eased_camera_blend(
+        0.0 if span <= 0.0 else (fraction - start["at"]) / span
+    )
+
+    def interpolate(name):
+        return (1.0 - blend) * float(start[name]) + blend * float(end[name])
+
+    direction = (1.0 - blend) * np.asarray(
+        start["direction"], dtype=float
+    ) + blend * np.asarray(end["direction"], dtype=float)
+    direction /= max(float(np.linalg.norm(direction)), 1.0e-12)
+    return {
+        "direction": direction,
+        "focus_d": interpolate("focus_d"),
+        "frame_d": interpolate("frame_d"),
+        "distance_d": interpolate("distance_d"),
+    }
+
+
+def camera_state(fraction: float):
+    """Estado de câmera para o preset selecionado."""
+    if CAMERA_MOTION == "cinematic":
+        return cinematic_camera_state(fraction)
+
+    direction = np.asarray(CAMERA_DIRECTION, dtype=float)
+    if CAMERA_MOTION == "orbit":
+        angle = CAMERA_ORBIT_DEGREES * (fraction - 0.5)
+        radians = np.radians(angle)
+        cosine, sine = np.cos(radians), np.sin(radians)
+        direction = np.array(
+            [
+                cosine * direction[0] - sine * direction[1],
+                sine * direction[0] + cosine * direction[1],
+                direction[2],
+            ]
+        )
+    direction /= max(float(np.linalg.norm(direction)), 1.0e-12)
+    return {
+        "direction": direction,
+        "focus_d": CAMERA_FOCUS_OFFSET_D,
+        "frame_d": CAMERA_FRAME_DIAMETERS,
+        "distance_d": CAMERA_DISTANCE_DIAMETERS,
+    }
+
+
+def apply_video_camera(camera, center, diameter, fraction):
+    state = camera_state(fraction)
+    focus = center + np.array(
+        [state["focus_d"] * diameter, 0.0, 0.0], dtype=np.float32
+    )
+    position = (
+        focus
+        + state["direction"] * state["distance_d"] * diameter
+    )
+    camera.focal_point = tuple(float(value) for value in focus)
+    camera.position = tuple(float(value) for value in position)
+    camera.up = (0.0, 0.0, 1.0)
+    camera.parallel_scale = 0.5 * state["frame_d"] * diameter
+
+
 def render_video(cache_files: list[Path], metadata, preview: int | None):
     destination = video_directory()
     destination.mkdir(parents=True, exist_ok=True)
@@ -2564,6 +2699,7 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
         "opacidade do volume proporcional ao deficit 1 - |u|/U "
         f"(nulo acima de |u| = {(1.0 - VOLUME_DEFICIT_FLOOR):.2f})",
         "escala invertida: MAIS CLARO = escoamento MAIS LENTO",
+        f"colormap perceptualmente uniforme: {VOLUME_COLORMAP}",
         "volume emissivo, sem iluminacao: a cor e o valor de |u|",
         f"opacidade maxima do volume: {VOLUME_MAX_OPACITY:g} por celula",
         f"faixa de {VOLUME_SOLID_BAND_CELLS:g} celula junto a parede "
@@ -2578,18 +2714,12 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
         )
     if SHOW_PARTICLES:
         notes.append("tracadores: elemento ilustrativo, nao medida")
+    notes.append(f"movimento de camera: {CAMERA_MOTION}")
     plotter.add_text(
         "\n".join(notes),
         position="lower_right",
         font_size=9,
         color=TEXT_COLOR,
-    )
-
-    focus = center + np.array(
-        [CAMERA_FOCUS_OFFSET_D * diameter, 0.0, 0.0], dtype=np.float32
-    )
-    base_offset = np.asarray(CAMERA_DIRECTION, dtype=float) * (
-        bounds[1] - bounds[0]
     )
 
     current_wake = 0
@@ -2702,21 +2832,8 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
             plane_actor.SetTexture(texture)
             plane_actor.Modified()
 
-        angle = CAMERA_ORBIT_DEGREES * (fraction - 0.5)
-        radians = np.radians(angle)
-        cosine, sine = np.cos(radians), np.sin(radians)
-        offset = np.array(
-            [
-                cosine * base_offset[0] - sine * base_offset[1],
-                sine * base_offset[0] + cosine * base_offset[1],
-                base_offset[2],
-            ]
-        )
         camera = plotter.camera
-        camera.focal_point = tuple(float(value) for value in focus)
-        camera.position = tuple(float(value) for value in focus + offset)
-        camera.up = (0.0, 0.0, 1.0)
-        camera.parallel_scale = 0.5 * CAMERA_FRAME_DIAMETERS * diameter
+        apply_video_camera(camera, center, diameter, fraction)
         plotter.reset_camera_clipping_range()
 
         video_time_actor.SetInput(
@@ -2765,6 +2882,7 @@ def main():
     global CROP_LEVEL, SHOW_STREAMLINES, SLICE_SCALAR, SPHERE_MODE
     global SHOW_LIC, VIDEO_SECONDS, SHOW_VOLUME, LEVEL_MATCHED_SMOOTHING
     global SHOW_PARTICLES, VOLUME_MAX_OPACITY, WAKE_OPACITY, SHOW_WAKE
+    global VOLUME_COLORMAP, CAMERA_MOTION
 
     parser = argparse.ArgumentParser(
         description="Reconstrói AMR do MFSim e visualiza o escoamento."
@@ -2841,6 +2959,23 @@ def main():
         help=(
             "opacidade máxima do volume por célula, entre 0 e 1 "
             f"(padrão: {VOLUME_MAX_OPACITY:g})"
+        ),
+    )
+    parser.add_argument(
+        "--volume-cmap",
+        choices=VOLUME_COLORMAPS,
+        help=(
+            "escala de cor do volume "
+            f"(padrão científico: {VOLUME_COLORMAP})"
+        ),
+    )
+    parser.add_argument(
+        "--camera",
+        choices=CAMERA_MOTIONS,
+        help=(
+            "movimento de câmera: cinematic = sequência elaborada, "
+            "orbit = órbita curta anterior, static = comparação fixa "
+            f"(padrão: {CAMERA_MOTION})"
         ),
     )
     parser.add_argument(
@@ -2956,6 +3091,10 @@ def main():
         if not 0.0 <= args.volume_opacity <= 1.0:
             parser.error("--volume-opacity deve estar entre 0 e 1")
         VOLUME_MAX_OPACITY = args.volume_opacity
+    if args.volume_cmap is not None:
+        VOLUME_COLORMAP = args.volume_cmap
+    if args.camera is not None:
+        CAMERA_MOTION = args.camera
     if args.wake_opacity is not None:
         if not 0.0 <= args.wake_opacity <= 1.0:
             parser.error("--wake-opacity deve estar entre 0 e 1")
