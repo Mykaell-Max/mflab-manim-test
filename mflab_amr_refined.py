@@ -197,11 +197,14 @@ FLOW_TEXTURE_GRID_X = 160
 FLOW_TEXTURE_SEED_RADII = 1.8
 FLOW_TEXTURE_LIFETIME_SECONDS = 6.0
 FLOW_TEXTURE_SMOOTH_CELLS = 1.15
+FLOW_TEXTURE_FLOOR_PERCENTILE = 60.0
 FLOW_TEXTURE_PERCENTILE = 99.0
 FLOW_TEXTURE_GAMMA = 0.85
-# Opacidade por célula da grade auxiliar: menos de 25% do máximo do volume
-# principal. É uma modulação interna, não uma segunda nuvem dominante.
-FLOW_TEXTURE_MAX_OPACITY = 0.008
+# A máscara de déficit reduz a densidade final para aproximadamente 0 a 0.5
+# neste caso. A transferência satura nessa faixa, em vez de esperar um valor
+# 1.0 que nunca ocorria. Continua zerada fora do volume principal.
+FLOW_TEXTURE_DISPLAY_MAX = 0.50
+FLOW_TEXTURE_MAX_OPACITY = 0.018
 FLOW_TEXTURE_COLORMAP = "magma"
 
 # Suavização casada ao nível AMR: cada região é borrada até o dx nativo do
@@ -1656,8 +1659,18 @@ def flow_texture_density(positions, weights, bounds, shape, visibility):
     )
     positive = density[density > 0.0]
     if positive.size:
-        scale = float(np.percentile(positive, FLOW_TEXTURE_PERCENTILE))
-        density = np.clip(density / max(scale, 1.0e-12), 0.0, 1.0)
+        floor = float(
+            np.percentile(positive, FLOW_TEXTURE_FLOOR_PERCENTILE)
+        )
+        ceiling = float(np.percentile(positive, FLOW_TEXTURE_PERCENTILE))
+        # Remove o fundo quase uniforme da nuvem. Só as concentrações acima
+        # do percentil 60 viram filamentos; isso cria contraste sem aumentar
+        # a extensão espacial da camada.
+        density = np.clip(
+            (density - floor) / max(ceiling - floor, 1.0e-12),
+            0.0,
+            1.0,
+        )
     density = density ** FLOW_TEXTURE_GAMMA
     return np.ascontiguousarray(density * visibility, dtype=np.float32)
 
@@ -2143,8 +2156,9 @@ def flow_texture_opacity_function():
     """Opacidade baixa: a densidade só modula o volume já existente."""
     function = vtk.vtkPiecewiseFunction()
     function.AddPoint(0.00, 0.0)
-    function.AddPoint(0.12, 0.0)
-    function.AddPoint(0.45, 0.35 * FLOW_TEXTURE_MAX_OPACITY)
+    function.AddPoint(0.04, 0.0)
+    function.AddPoint(0.18, 0.35 * FLOW_TEXTURE_MAX_OPACITY)
+    function.AddPoint(FLOW_TEXTURE_DISPLAY_MAX, FLOW_TEXTURE_MAX_OPACITY)
     function.AddPoint(1.00, FLOW_TEXTURE_MAX_OPACITY)
     return function
 
@@ -2845,7 +2859,7 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
             flow_grid,
             scalars="density",
             cmap=FLOW_TEXTURE_COLORMAP,
-            clim=(0.0, 1.0),
+            clim=(0.0, FLOW_TEXTURE_DISPLAY_MAX),
             shade=False,
             ambient=1.0,
             diffuse=0.0,
@@ -2897,7 +2911,9 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
     # SSAA (supersampling) apaga completamente o volume: medido em 0% dos
     # pixels contra 9% sem anti-aliasing. O passe de volume não sobrevive ao
     # render em resolução ampliada. FXAA é pós-processo e convive.
-    antialiasing = "fxaa" if SHOW_VOLUME else "ssaa"
+    antialiasing = (
+        "fxaa" if SHOW_VOLUME or SHOW_FLOW_TEXTURE else "ssaa"
+    )
     try:
         plotter.enable_anti_aliasing(antialiasing)
     except Exception as error:  # noqa: BLE001 - depende do driver
