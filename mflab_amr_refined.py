@@ -180,11 +180,11 @@ VOLUME_SAMPLE_CELLS = 0.5
 # fluido, não medida. Sem excluir, essa casca aparece como uma bola de
 # voxels grudada na esfera.
 VOLUME_SOLID_BAND_CELLS = 1.5
-# Cividis é perceptualmente uniforme e legível para as formas mais comuns de
-# daltonismo. A inversão é intencional: o núcleo lento fica claro e o
+# Magma também é perceptualmente uniforme e teve contraste visual melhor
+# neste campo. A inversão é intencional: o núcleo lento fica claro e o
 # escoamento livre, que já é transparente, ocupa o extremo escuro. A barra
 # continua exibindo os valores físicos de |u| em escala linear e fixa.
-VOLUME_COLORMAP = "cividis_r"
+VOLUME_COLORMAP = "magma_r"
 VOLUME_COLORMAPS = ("cividis_r", "viridis_r", "magma_r", "inferno_r")
 
 # Suavização casada ao nível AMR: cada região é borrada até o dx nativo do
@@ -193,14 +193,18 @@ VOLUME_COLORMAPS = ("cividis_r", "viridis_r", "magma_r", "inferno_r")
 # aparece como blocos retangulares.
 LEVEL_MATCHED_SMOOTHING = True
 
-# O corte com LIC é bonito de frente, mas plano. Desligado por padrão no
-# vídeo; ligue com --lic se a câmera não for orbitar.
+# O LIC é um corte central, não um volume. Funciona bem nos presets atuais,
+# que permanecem majoritariamente laterais, e pode ser ligado com --lic.
 SHOW_LIC = False
 LIC_WIDTH = 1024
 LIC_STEPS = 48
 LIC_CYCLES = 3.0  # listras por janela de convolução
 LIC_TURNS_PER_SECOND = 0.55
-LIC_CONTRAST = 0.65  # quanto a textura modula a cor do campo
+# A textura não é ruído decorativo: é convolvida ao longo das linhas de
+# corrente e colorida pela mesma escala de |u| do volume. A vorticidade
+# controla apenas o alfa, fazendo o plano desaparecer fora da esteira.
+LIC_CONTRAST = 0.48  # quanto a textura modula a luminância da cor
+LIC_MAX_OPACITY = 0.60
 LIC_FLIP_V = False  # inverta se a textura sair espelhada na vertical
 
 CAMERA_ORBIT_DEGREES = 16.0
@@ -2114,24 +2118,45 @@ def load_fields(cache_files):
     return fields, speeds, np.asarray(times), origin, spacing
 
 
-def plane_texture_image(luminance, vorticity, slice_range, table):
-    """Combina a textura LIC com a cor do campo escalar.
+def plane_texture_image(
+    luminance,
+    speed,
+    vorticity,
+    speed_range,
+    slice_range,
+    table,
+):
+    """Textura vetorial colorida por |u| e revelada pela vorticidade.
 
-    A luminância vem do LIC (direção do escoamento) e a matiz vem da
-    vorticidade (intensidade). São dois canais independentes carregando
-    duas grandezas distintas — nada é inventado.
+    A luminância do LIC mostra a direção local do vetor, a matiz usa a mesma
+    escala de |u| do volume e a vorticidade controla apenas a transparência.
+    São canais diferentes, todos derivados do dado; nenhum detalhe é
+    inventado para dar aparência turbulenta a um caso laminar.
     """
-    normalized = np.clip(
+    normalized_speed = np.clip(
+        (speed - speed_range[0])
+        / max(speed_range[1] - speed_range[0], 1.0e-12),
+        0.0,
+        1.0,
+    )
+    indices = (normalized_speed * (len(table) - 1)).astype(np.int32)
+    rgba = table[indices].astype(np.float32)
+
+    shade = (1.0 - LIC_CONTRAST) + LIC_CONTRAST * luminance
+    rgba[..., :3] *= shade[..., None]
+
+    normalized_vorticity = np.clip(
         (vorticity - slice_range[0])
         / max(slice_range[1] - slice_range[0], 1.0e-12),
         0.0,
         1.0,
     )
-    indices = (normalized * (len(table) - 1)).astype(np.int32)
-    rgba = table[indices].astype(np.float32)
-
-    shade = (1.0 - LIC_CONTRAST) + LIC_CONTRAST * luminance
-    rgba[..., :3] *= shade[..., None]
+    visibility = np.clip(
+        normalized_vorticity / max(SLICE_FADE_FRACTION, 1.0e-12),
+        0.0,
+        1.0,
+    )
+    rgba[..., 3] = visibility * LIC_MAX_OPACITY * 255.0
     return np.clip(rgba, 0, 255).astype(np.uint8)
 
 
@@ -2156,7 +2181,7 @@ def prepare_lic(fields, spacing, slice_index, width):
     generator = np.random.default_rng(12345)
     noise = generator.random((height, width)).astype(np.float32)
 
-    samples, vorticities = [], []
+    samples, speeds, vorticities = [], [], []
     for index, field in enumerate(fields):
         jacobian = jacobian_from_block(field, float(spacing[0]))
         vorticity = vorticity_magnitude(jacobian)[:, slice_index, :]
@@ -2169,6 +2194,8 @@ def prepare_lic(fields, spacing, slice_index, width):
             field[:, slice_index, :, 2], width, height
         )
         samples.append(lic_samples(velocity_x, velocity_z, noise, LIC_STEPS))
+        speed = np.linalg.norm(field[:, slice_index, :, :], axis=-1)
+        speeds.append(resample_plane(speed, width, height))
         vorticities.append(resample_plane(vorticity, width, height))
         print(
             f"    LIC {index + 1}/{len(fields)} • "
@@ -2178,7 +2205,7 @@ def prepare_lic(fields, spacing, slice_index, width):
 
     total = sum(block.nbytes for block in samples) / 1024 ** 3
     print(f"  amostras LIC em memória: {total:.2f} GB")
-    return samples, vorticities, height, width
+    return samples, speeds, vorticities, height, width
 
 
 def diagnose_volume(cache_files: list[Path], metadata):
@@ -2447,15 +2474,9 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
     slice_index = int(round((center[1] - origin[1]) / spacing[1]))
     slice_range = tuple(metadata["slice_range"])
 
-    slice_table = pv.LookupTable()
-    slice_table.apply_cmap(SLICE_COLORMAP, n_values=256)
-    table_values = np.asarray(slice_table.values).copy()
-    ramp = np.clip(
-        np.linspace(0.0, 1.0, len(table_values)) / SLICE_FADE_FRACTION,
-        0.0,
-        1.0,
-    )
-    table_values[:, 3] = (ramp * 255).astype(np.uint8)
+    lic_table = pv.LookupTable()
+    lic_table.apply_cmap(VOLUME_COLORMAP, n_values=256)
+    table_values = np.asarray(lic_table.values).copy()
 
     lic_data = None
     if SHOW_LIC:
@@ -2470,8 +2491,8 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
 
     # Com um único timestep o campo é tratado como congelado, o que a
     # Re ~ 100 é fisicamente correto: a esteira é estacionária e todo o
-    # movimento do vídeo vem das partículas. O que não se pode fazer é
-    # inventar tempo físico que não existe no dado.
+    # movimento visual vem da câmera e, quando habilitados, do LIC ou dos
+    # traçadores. O que não se pode fazer é inventar tempo físico no dado.
     steady = len(times) < 2
     framed_width = CAMERA_FRAME_DIAMETERS * (VIDEO_SIZE[0] / VIDEO_SIZE[1])
     transit_dt = (framed_width * diameter / REFERENCE_VELOCITY) / (
@@ -2483,7 +2504,8 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
         dt = transit_dt
         print(
             f"  UM timestep no cache: campo tratado como estacionário, "
-            f"t = {times[0]:.5f} fixo. Todo o movimento vem das partículas."
+            f"t = {times[0]:.5f} fixo. O movimento visual vem da câmera"
+            + (" e da textura LIC." if SHOW_LIC else ".")
         )
         print(
             "  Para animar também a formação da esteira, rode "
@@ -2714,6 +2736,11 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
         )
     if SHOW_PARTICLES:
         notes.append("tracadores: elemento ilustrativo, nao medida")
+    if SHOW_LIC:
+        notes.append(
+            "textura LIC: direcao do vetor; cor = |u|; "
+            "alfa controlado pela vorticidade"
+        )
     notes.append(f"movimento de camera: {CAMERA_MOTION}")
     plotter.add_text(
         "\n".join(notes),
@@ -2814,16 +2841,24 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
             current_wake = nearest
 
         if SHOW_LIC and plane_actor is not None:
-            samples, vorticities, height, width = lic_data
+            samples, lic_speeds, vorticities, height, width = lic_data
             phase = LIC_TURNS_PER_SECOND * index / VIDEO_FPS
             luminance = (1.0 - blend) * lic_luminance(
                 samples[lower], phase, LIC_CYCLES
             ) + blend * lic_luminance(samples[upper], phase, LIC_CYCLES)
+            lic_speed = (1.0 - blend) * lic_speeds[lower] + (
+                blend * lic_speeds[upper]
+            )
             vorticity = (1.0 - blend) * vorticities[lower] + (
                 blend * vorticities[upper]
             )
             image = plane_texture_image(
-                luminance, vorticity, slice_range, table_values
+                luminance,
+                lic_speed,
+                vorticity,
+                tuple(metadata["speed_range"]),
+                slice_range,
+                table_values,
             )
             if LIC_FLIP_V:
                 image = image[::-1]
@@ -2882,7 +2917,7 @@ def main():
     global CROP_LEVEL, SHOW_STREAMLINES, SLICE_SCALAR, SPHERE_MODE
     global SHOW_LIC, VIDEO_SECONDS, SHOW_VOLUME, LEVEL_MATCHED_SMOOTHING
     global SHOW_PARTICLES, VOLUME_MAX_OPACITY, WAKE_OPACITY, SHOW_WAKE
-    global VOLUME_COLORMAP, CAMERA_MOTION
+    global VOLUME_COLORMAP, CAMERA_MOTION, LIC_MAX_OPACITY, LIC_CONTRAST
 
     parser = argparse.ArgumentParser(
         description="Reconstrói AMR do MFSim e visualiza o escoamento."
@@ -2922,7 +2957,25 @@ def main():
     parser.add_argument(
         "--lic",
         action="store_true",
-        help="liga o corte com textura LIC (plano; ruim sob rotação)",
+        help="liga o corte central com textura vetorial LIC",
+    )
+    parser.add_argument(
+        "--lic-opacity",
+        type=float,
+        metavar="ALPHA",
+        help=(
+            "opacidade máxima da textura LIC, entre 0 e 1 "
+            f"(padrão: {LIC_MAX_OPACITY:g})"
+        ),
+    )
+    parser.add_argument(
+        "--lic-contrast",
+        type=float,
+        metavar="VALUE",
+        help=(
+            "contraste da textura LIC, entre 0 e 1 "
+            f"(padrão: {LIC_CONTRAST:g})"
+        ),
     )
     parser.add_argument(
         "--particles",
@@ -3077,6 +3130,14 @@ def main():
         SPHERE_MODE = args.sphere
     if args.lic:
         SHOW_LIC = True
+    if args.lic_opacity is not None:
+        if not 0.0 <= args.lic_opacity <= 1.0:
+            parser.error("--lic-opacity deve estar entre 0 e 1")
+        LIC_MAX_OPACITY = args.lic_opacity
+    if args.lic_contrast is not None:
+        if not 0.0 <= args.lic_contrast <= 1.0:
+            parser.error("--lic-contrast deve estar entre 0 e 1")
+        LIC_CONTRAST = args.lic_contrast
     if args.particles:
         SHOW_PARTICLES = True
     if args.no_volume:
