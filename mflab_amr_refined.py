@@ -193,8 +193,9 @@ VOLUME_COLORMAPS = ("cividis_r", "viridis_r", "magma_r", "inferno_r")
 # aparece como blocos retangulares.
 LEVEL_MATCHED_SMOOTHING = True
 
-# O LIC é um corte central, não um volume. Funciona bem nos presets atuais,
-# que permanecem majoritariamente laterais, e pode ser ligado com --lic.
+# O LIC é um corte central, não um volume. É útil como diagnóstico do campo
+# vetorial, mas não faz parte do preset cinematográfico padrão: em closes ele
+# evidencia a discretização do plano e achata visualmente a cena.
 SHOW_LIC = False
 # A textura é vista em um vídeo de 1920 px e, nos closes, ocupa boa parte do
 # quadro. Gerar só 1024 px deixava os texels visíveis. A filtragem linear e
@@ -236,7 +237,9 @@ CINEMATIC_CAMERA_KEYFRAMES = (
     },
     {
         "at": 0.43,
-        "direction": (-0.08, -1.00, 0.12),
+        # Vista deliberadamente oblíqua: a esteira recua em profundidade em
+        # vez de ocupar a tela como uma faixa lateral plana.
+        "direction": (-0.42, -0.85, 0.34),
         "focus_d": 2.6,
         "frame_d": 4.4,
         "distance_d": 10.0,
@@ -2985,7 +2988,7 @@ def main():
     parser.add_argument(
         "--lic",
         action="store_true",
-        help="liga o corte central com textura vetorial LIC",
+        help="liga o corte diagnóstico 2-D com textura vetorial LIC",
     )
     parser.add_argument(
         "--lic-opacity",
