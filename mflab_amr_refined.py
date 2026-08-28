@@ -187,6 +187,23 @@ VOLUME_SOLID_BAND_CELLS = 1.5
 VOLUME_COLORMAP = "magma_r"
 VOLUME_COLORMAPS = ("cividis_r", "viridis_r", "magma_r", "inferno_r")
 
+# Textura volumétrica de traçador passivo. As partículas nunca são
+# desenhadas: formam uma densidade 3-D auxiliar, suavizada e multiplicada
+# pela mesma máscara de déficit que torna o volume principal visível. Assim
+# a textura não pode poluir o escoamento livre nem deixar riscos na imagem.
+SHOW_FLOW_TEXTURE = False
+FLOW_TEXTURE_PARTICLES = 50_000
+FLOW_TEXTURE_GRID_X = 160
+FLOW_TEXTURE_SEED_RADII = 1.8
+FLOW_TEXTURE_LIFETIME_SECONDS = 6.0
+FLOW_TEXTURE_SMOOTH_CELLS = 1.15
+FLOW_TEXTURE_PERCENTILE = 99.0
+FLOW_TEXTURE_GAMMA = 0.85
+# Opacidade por célula da grade auxiliar: menos de 25% do máximo do volume
+# principal. É uma modulação interna, não uma segunda nuvem dominante.
+FLOW_TEXTURE_MAX_OPACITY = 0.008
+FLOW_TEXTURE_COLORMAP = "magma"
+
 # Suavização casada ao nível AMR: cada região é borrada até o dx nativo do
 # nível que prevaleceu ali. Não é maquiagem — é remover detalhe que a
 # interpolação inventou. Sem isso o nível 0 (dx 0.032 amostrado a 0.002)
@@ -1523,6 +1540,18 @@ def sample_vectors(field, origin, spacing, positions):
     )
 
 
+def sample_scalar(field, origin, spacing, positions):
+    """Interpolação trilinear de um escalar nas posições dadas."""
+    coordinates = ((positions - origin) / spacing).T
+    return map_coordinates(
+        field,
+        coordinates,
+        order=1,
+        mode="nearest",
+        prefilter=False,
+    )
+
+
 def advect_rk4(positions, sampler, dt):
     """Runge-Kutta 4. Passo fixo: o campo é suave e o dt vem do fps."""
     k1 = sampler(positions)
@@ -1571,6 +1600,66 @@ def expired(positions, ages, bounds, lifetime):
         | (positions[:, 2] > zmax)
     )
     return outside | (ages > lifetime)
+
+
+def flow_texture_geometry(bounds):
+    """Grade auxiliar isotrópica, bem menor que a reconstrução científica."""
+    minimum = np.asarray((bounds[0], bounds[2], bounds[4]), dtype=np.float32)
+    maximum = np.asarray((bounds[1], bounds[3], bounds[5]), dtype=np.float32)
+    extent = maximum - minimum
+    scale = FLOW_TEXTURE_GRID_X / max(float(extent[0]), 1.0e-12)
+    shape = tuple(
+        max(16, int(round(float(length) * scale))) for length in extent
+    )
+    spacing = extent / np.asarray(shape, dtype=np.float32)
+    origin = minimum + 0.5 * spacing
+
+    axes = [
+        origin[axis] + np.arange(shape[axis], dtype=np.float32) * spacing[axis]
+        for axis in range(3)
+    ]
+    mesh = np.meshgrid(*axes, indexing="ij")
+    points = np.column_stack(
+        [component.ravel(order="F") for component in mesh]
+    ).astype(np.float32)
+    return shape, origin, spacing, points
+
+
+def flow_visibility_masks(speeds, origin, spacing, points, shape):
+    """Máscara 3-D que proíbe a textura fora do volume de velocidade."""
+    masks = []
+    for speed in speeds:
+        sampled = sample_scalar(speed, origin, spacing, points).reshape(
+            shape, order="F"
+        )
+        deficit = 1.0 - sampled / REFERENCE_VELOCITY
+        normalized = np.clip(
+            (deficit - VOLUME_DEFICIT_FLOOR)
+            / max(VOLUME_DEFICIT_FULL - VOLUME_DEFICIT_FLOOR, 1.0e-9),
+            0.0,
+            1.0,
+        )
+        masks.append((normalized ** VOLUME_GAMMA).astype(np.float32))
+    return masks
+
+
+def flow_texture_density(positions, weights, bounds, shape, visibility):
+    """Partículas invisíveis -> densidade volumétrica suave e mascarada."""
+    edges = (
+        np.linspace(bounds[0], bounds[1], shape[0] + 1),
+        np.linspace(bounds[2], bounds[3], shape[1] + 1),
+        np.linspace(bounds[4], bounds[5], shape[2] + 1),
+    )
+    density = np.histogramdd(positions, bins=edges, weights=weights)[0]
+    density = gaussian_filter(
+        density.astype(np.float32), FLOW_TEXTURE_SMOOTH_CELLS
+    )
+    positive = density[density > 0.0]
+    if positive.size:
+        scale = float(np.percentile(positive, FLOW_TEXTURE_PERCENTILE))
+        density = np.clip(density / max(scale, 1.0e-12), 0.0, 1.0)
+    density = density ** FLOW_TEXTURE_GAMMA
+    return np.ascontiguousarray(density * visibility, dtype=np.float32)
 
 
 def trail_connectivity(count, trail):
@@ -2050,6 +2139,16 @@ def volume_opacity_function(scalar_range):
     return function
 
 
+def flow_texture_opacity_function():
+    """Opacidade baixa: a densidade só modula o volume já existente."""
+    function = vtk.vtkPiecewiseFunction()
+    function.AddPoint(0.00, 0.0)
+    function.AddPoint(0.12, 0.0)
+    function.AddPoint(0.45, 0.35 * FLOW_TEXTURE_MAX_OPACITY)
+    function.AddPoint(1.00, FLOW_TEXTURE_MAX_OPACITY)
+    return function
+
+
 def video_directory() -> Path:
     return scene_directory() / "video"
 
@@ -2511,8 +2610,9 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
 
     # Com um único timestep o campo é tratado como congelado, o que a
     # Re ~ 100 é fisicamente correto: a esteira é estacionária e todo o
-    # movimento visual vem da câmera e, quando habilitados, do LIC ou dos
-    # traçadores. O que não se pode fazer é inventar tempo físico no dado.
+    # movimento visual vem da câmera e, quando habilitados, do LIC, da
+    # textura volumétrica ou dos traçadores. O que não se pode fazer é
+    # inventar tempo físico no dado.
     steady = len(times) < 2
     framed_width = CAMERA_FRAME_DIAMETERS * (VIDEO_SIZE[0] / VIDEO_SIZE[1])
     transit_dt = (framed_width * diameter / REFERENCE_VELOCITY) / (
@@ -2525,7 +2625,13 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
         print(
             f"  UM timestep no cache: campo tratado como estacionário, "
             f"t = {times[0]:.5f} fixo. O movimento visual vem da câmera"
-            + (" e da textura LIC." if SHOW_LIC else ".")
+            + (
+                " e da textura volumétrica."
+                if SHOW_FLOW_TEXTURE
+                else " e da textura LIC."
+                if SHOW_LIC
+                else "."
+            )
         )
         print(
             "  Para animar também a formação da esteira, rode "
@@ -2558,6 +2664,40 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
         (PARTICLE_TRAIL, PARTICLE_COUNT), dtype=np.float32
     )
     connectivity = trail_connectivity(PARTICLE_COUNT, PARTICLE_TRAIL)
+
+    flow_shape = flow_origin = flow_spacing = flow_masks = None
+    flow_positions = flow_ages = flow_weights = None
+    flow_lifetime_frames = FLOW_TEXTURE_LIFETIME_SECONDS * VIDEO_FPS
+    if SHOW_FLOW_TEXTURE:
+        (
+            flow_shape,
+            flow_origin,
+            flow_spacing,
+            flow_points,
+        ) = flow_texture_geometry(bounds)
+        print(
+            "Preparando textura volumétrica: "
+            f"grade {flow_shape[0]}x{flow_shape[1]}x{flow_shape[2]} • "
+            f"{FLOW_TEXTURE_PARTICLES:,} partículas invisíveis"
+        )
+        flow_masks = flow_visibility_masks(
+            speeds, origin, spacing, flow_points, flow_shape
+        )
+        flow_seed_radius = FLOW_TEXTURE_SEED_RADII * diameter
+        flow_positions = spawn_positions(
+            FLOW_TEXTURE_PARTICLES,
+            bounds,
+            generator,
+            center,
+            flow_seed_radius,
+            inlet=1.0,
+        )
+        flow_ages = generator.uniform(
+            0.0, flow_lifetime_frames, FLOW_TEXTURE_PARTICLES
+        ).astype(np.float32)
+        flow_weights = generator.uniform(
+            0.35, 1.0, FLOW_TEXTURE_PARTICLES
+        ).astype(np.float32)
 
     plotter = pv.Plotter(off_screen=True, window_size=list(VIDEO_SIZE))
     plotter.set_background(BACKGROUND)
@@ -2686,6 +2826,50 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
             )
         )
 
+    flow_dataset = None
+    if SHOW_FLOW_TEXTURE:
+        initial_density = flow_texture_density(
+            flow_positions,
+            flow_weights,
+            bounds,
+            flow_shape,
+            flow_masks[0],
+        )
+        flow_grid = pv.ImageData(
+            dimensions=flow_shape,
+            spacing=tuple(float(value) for value in flow_spacing),
+            origin=tuple(float(value) for value in flow_origin),
+        )
+        flow_grid.point_data["density"] = initial_density.ravel(order="F")
+        flow_actor = plotter.add_volume(
+            flow_grid,
+            scalars="density",
+            cmap=FLOW_TEXTURE_COLORMAP,
+            clim=(0.0, 1.0),
+            shade=False,
+            ambient=1.0,
+            diffuse=0.0,
+            specular=0.0,
+            mapper="smart",
+            reset_camera=False,
+            show_scalar_bar=False,
+        )
+        flow_opacity = flow_texture_opacity_function()
+        flow_actor.prop.SetScalarOpacity(flow_opacity)
+        flow_actor.prop.SetScalarOpacityUnitDistance(
+            float(np.min(flow_spacing))
+        )
+        flow_actor.prop.SetInterpolationTypeToLinear()
+        flow_actor.mapper.SetAutoAdjustSampleDistances(False)
+        flow_actor.mapper.SetSampleDistance(
+            0.65 * float(np.min(flow_spacing))
+        )
+        flow_dataset = flow_actor.mapper.dataset
+        print(
+            "  textura 3-D: densidade mascarada pelo déficit • "
+            f"opacidade máxima {FLOW_TEXTURE_MAX_OPACITY:g} por célula"
+        )
+
     tracers = pv.PolyData()
     tracers.points = history.reshape(-1, 3)
     tracers.lines = connectivity
@@ -2761,6 +2945,11 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
         notes.append(
             "textura LIC: direcao do vetor; cor = |u|; "
             "alfa controlado pela vorticidade"
+        )
+    if SHOW_FLOW_TEXTURE:
+        notes.append(
+            "textura 3-D: densidade de tracador passivo, invisivel fora "
+            "do volume de deficit"
         )
     notes.append(f"movimento de camera: {CAMERA_MOTION}")
     notes.append(
@@ -2840,6 +3029,26 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
         tracers.Modified()
         tracer_actor.mapper.Modified()
 
+        if SHOW_FLOW_TEXTURE:
+            flow_positions = advect_rk4(flow_positions, sampler, dt)
+            flow_ages += 1.0
+            flow_dead = expired(
+                flow_positions, flow_ages, bounds, flow_lifetime_frames
+            )
+            if flow_dead.any():
+                fresh = spawn_positions(
+                    int(flow_dead.sum()),
+                    bounds,
+                    generator,
+                    center,
+                    flow_seed_radius,
+                )
+                flow_positions[flow_dead] = fresh
+                flow_ages[flow_dead] = 0.0
+                flow_weights[flow_dead] = generator.uniform(
+                    0.35, 1.0, int(flow_dead.sum())
+                )
+
         if not capture:
             # Só a advecção precisa rodar em todos os passos; ler a esteira
             # do disco, montar a textura e gravar o PNG são exclusivos do
@@ -2865,6 +3074,21 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
                 )
                 wake_actor.mapper.ScalarVisibilityOff()
             current_wake = nearest
+
+        if flow_dataset is not None:
+            visibility = (1.0 - blend) * flow_masks[lower] + (
+                blend * flow_masks[upper]
+            )
+            density = flow_texture_density(
+                flow_positions,
+                flow_weights,
+                bounds,
+                flow_shape,
+                visibility,
+            )
+            flow_dataset.point_data["density"] = density.ravel(order="F")
+            flow_dataset.Modified()
+            flow_actor.mapper.Modified()
 
         if SHOW_LIC and plane_actor is not None:
             samples, lic_speeds, vorticities, height, width = lic_data
@@ -2949,6 +3173,7 @@ def main():
     global SHOW_LIC, VIDEO_SECONDS, SHOW_VOLUME, LEVEL_MATCHED_SMOOTHING
     global SHOW_PARTICLES, VOLUME_MAX_OPACITY, WAKE_OPACITY, SHOW_WAKE
     global VOLUME_COLORMAP, CAMERA_MOTION, LIC_MAX_OPACITY, LIC_CONTRAST
+    global SHOW_FLOW_TEXTURE, FLOW_TEXTURE_MAX_OPACITY
 
     parser = argparse.ArgumentParser(
         description="Reconstrói AMR do MFSim e visualiza o escoamento."
@@ -3012,6 +3237,23 @@ def main():
         "--particles",
         action="store_true",
         help="liga os traçadores (cosméticos, não são medida)",
+    )
+    parser.add_argument(
+        "--flow-texture",
+        action="store_true",
+        help=(
+            "liga densidade volumétrica de traçador passivo; "
+            "não desenha partículas nem rastros"
+        ),
+    )
+    parser.add_argument(
+        "--flow-texture-opacity",
+        type=float,
+        metavar="ALPHA",
+        help=(
+            "opacidade máxima por célula da textura 3-D, entre 0 e 1 "
+            f"(padrão: {FLOW_TEXTURE_MAX_OPACITY:g})"
+        ),
     )
     parser.add_argument(
         "--no-volume",
@@ -3171,6 +3413,12 @@ def main():
         LIC_CONTRAST = args.lic_contrast
     if args.particles:
         SHOW_PARTICLES = True
+    if args.flow_texture:
+        SHOW_FLOW_TEXTURE = True
+    if args.flow_texture_opacity is not None:
+        if not 0.0 <= args.flow_texture_opacity <= 1.0:
+            parser.error("--flow-texture-opacity deve estar entre 0 e 1")
+        FLOW_TEXTURE_MAX_OPACITY = args.flow_texture_opacity
     if args.no_volume:
         SHOW_VOLUME = False
     if args.no_smoothing:
