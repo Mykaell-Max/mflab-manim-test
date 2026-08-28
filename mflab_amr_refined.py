@@ -213,15 +213,15 @@ FLOW_TEXTURE_MAX_OPACITY = 0.010
 FLOW_TEXTURE_COLORMAP = "magma"
 
 # Segundo volume científico: vorticidade adimensional |ω|D/U. A velocidade
-# continua como envelope quente; a vorticidade usa uma paleta fria e uma
-# transferência seletiva para revelar rotação sem virar uma névoa uniforme.
+# continua como envelope quente; a vorticidade aparece apenas como um acento
+# ciano nos valores altos, sem competir com a escala de cores principal.
 SHOW_VORTICITY_VOLUME = False
-VORTICITY_VOLUME_COLORMAP = "winter"
-VORTICITY_VOLUME_MAX_OPACITY = 0.016
+VORTICITY_VOLUME_COLOR = "#32D6E6"
+VORTICITY_VOLUME_MAX_OPACITY = 0.010
 VORTICITY_VOLUME_PERCENTILE = 99.5
-VORTICITY_VOLUME_ONSET_FRACTION = 0.10
-VORTICITY_VOLUME_MID_FRACTION = 0.35
-VORTICITY_VOLUME_MASK_D = 0.05
+VORTICITY_VOLUME_ONSET_FRACTION = 0.35
+VORTICITY_VOLUME_MID_FRACTION = 0.65
+VORTICITY_VOLUME_MASK_D = 0.10
 
 # Suavização casada ao nível AMR: cada região é borrada até o dx nativo do
 # nível que prevaleceu ali. Não é maquiagem — é remover detalhe que a
@@ -2291,6 +2291,19 @@ def vorticity_volume_opacity_function(scalar_range):
     return function
 
 
+def vorticity_volume_color_function(scalar_range):
+    """Cor constante: a intensidade é comunicada só pela opacidade."""
+    hexadecimal = VORTICITY_VOLUME_COLOR.lstrip("#")
+    rgb = tuple(
+        int(hexadecimal[index : index + 2], 16) / 255.0
+        for index in (0, 2, 4)
+    )
+    function = vtk.vtkColorTransferFunction()
+    function.AddRGBPoint(float(scalar_range[0]), *rgb)
+    function.AddRGBPoint(float(scalar_range[1]), *rgb)
+    return function
+
+
 def video_directory() -> Path:
     return scene_directory() / "video"
 
@@ -3055,7 +3068,7 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
         vorticity_actor = plotter.add_volume(
             vorticity_grid,
             scalars="omega_star",
-            cmap=VORTICITY_VOLUME_COLORMAP,
+            cmap="gray",
             clim=vorticity_range,
             shade=False,
             ambient=1.0,
@@ -3063,23 +3076,14 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
             specular=0.0,
             mapper="smart",
             reset_camera=False,
-            show_scalar_bar=True,
-            scalar_bar_args={
-                "title": "|omega| D/U",
-                "n_labels": 5,
-                "fmt": "%.2f",
-                "color": TEXT_COLOR,
-                "position_x": 0.84,
-                "position_y": 0.16,
-                "width": 0.025,
-                "height": 0.62,
-                "vertical": True,
-            },
+            show_scalar_bar=False,
         )
         vorticity_opacity = vorticity_volume_opacity_function(
             vorticity_range
         )
+        vorticity_color = vorticity_volume_color_function(vorticity_range)
         vorticity_actor.prop.SetScalarOpacity(vorticity_opacity)
+        vorticity_actor.prop.SetColor(vorticity_color)
         vorticity_actor.prop.SetScalarOpacityUnitDistance(
             float(np.min(flow_spacing))
         )
@@ -3090,8 +3094,8 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
         )
         vorticity_dataset = vorticity_actor.mapper.dataset
         print(
-            "  volume de vorticidade: paleta "
-            f"{VORTICITY_VOLUME_COLORMAP} • opacidade máxima "
+            "  acento de vorticidade: cor "
+            f"{VORTICITY_VOLUME_COLOR} • opacidade máxima "
             f"{VORTICITY_VOLUME_MAX_OPACITY:g} por célula"
         )
 
@@ -3186,8 +3190,9 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
         )
     if SHOW_VORTICITY_VOLUME:
         notes.append(
-            f"volume frio: |omega|D/U, escala 0 a "
-            f"{vorticity_range[1]:.3g} fixa entre frames"
+            f"acento ciano: |omega|D/U acima de "
+            f"{VORTICITY_VOLUME_ONSET_FRACTION * vorticity_range[1]:.3g} "
+            f"(maximo fixo {vorticity_range[1]:.3g})"
         )
         notes.append(
             f"vorticidade excluida ate {VORTICITY_VOLUME_MASK_D:g} D "
