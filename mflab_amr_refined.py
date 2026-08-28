@@ -211,6 +211,7 @@ TEXT_COLOR = "#F1F6F9"
 GEOMETRY_COLOR = "#9AA6AE"
 WAKE_COLOR = "#37D6E8"
 WAKE_OPACITY = 1.0
+SHOW_WAKE = True
 TRACER_COLOR = "#E8F4FF"
 COLORMAP = "viridis"
 
@@ -2413,20 +2414,23 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
             reset_camera=False,
         )
 
-    wake_actor = plotter.add_mesh(
-        read_optional(
-            scene_directory() / f"wake.{timestep_number(cache_files[0]):09d}.vtp"
-        ),
-        color=WAKE_COLOR,
-        opacity=WAKE_OPACITY,
-        smooth_shading=True,
-        ambient=0.30,
-        diffuse=0.80,
-        specular=0.20,
-        specular_power=15,
-        show_scalar_bar=False,
-        reset_camera=False,
-    )
+    wake_actor = None
+    if SHOW_WAKE:
+        wake_actor = plotter.add_mesh(
+            read_optional(
+                scene_directory()
+                / f"wake.{timestep_number(cache_files[0]):09d}.vtp"
+            ),
+            color=WAKE_COLOR,
+            opacity=WAKE_OPACITY,
+            smooth_shading=True,
+            ambient=0.30,
+            diffuse=0.80,
+            specular=0.20,
+            specular_power=15,
+            show_scalar_bar=False,
+            reset_camera=False,
+        )
 
     volume_grid = None
     volume_dataset = None
@@ -2565,7 +2569,7 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
         f"faixa de {VOLUME_SOLID_BAND_CELLS:g} celula junto a parede "
         "excluida do volume (interface imersa borrada)",
     ]
-    if metadata.get("wake_mode") == "reverse":
+    if SHOW_WAKE and metadata.get("wake_mode") == "reverse":
         notes.append("superficie ciano: bolha de recirculacao, u = 0")
     if LEVEL_MATCHED_SMOOTHING:
         notes.append(
@@ -2662,20 +2666,21 @@ def render_video(cache_files: list[Path], metadata, preview: int | None):
             continue
 
         nearest = int(np.argmin(np.abs(times - physical)))
-        if nearest != current_wake and volume_dataset is not None:
-            volume_dataset.point_data["speed"] = speeds[nearest].ravel(
-                order="F"
-            )
-            volume_dataset.Modified()
-            volume_actor.mapper.Modified()
         if nearest != current_wake:
-            wake_actor.mapper.SetInputData(
-                read_optional(
-                    scene_directory()
-                    / f"wake.{timestep_number(cache_files[nearest]):09d}.vtp"
+            if volume_dataset is not None:
+                volume_dataset.point_data["speed"] = speeds[nearest].ravel(
+                    order="F"
                 )
-            )
-            wake_actor.mapper.ScalarVisibilityOff()
+                volume_dataset.Modified()
+                volume_actor.mapper.Modified()
+            if wake_actor is not None:
+                wake_actor.mapper.SetInputData(
+                    read_optional(
+                        scene_directory()
+                        / f"wake.{timestep_number(cache_files[nearest]):09d}.vtp"
+                    )
+                )
+                wake_actor.mapper.ScalarVisibilityOff()
             current_wake = nearest
 
         if SHOW_LIC and plane_actor is not None:
@@ -2759,7 +2764,7 @@ def main():
     global OUTPUT_DIR, TARGET_DX, WAKE_MODE, Q_STAR_LEVEL, Q_MASK_DIAMETERS
     global CROP_LEVEL, SHOW_STREAMLINES, SLICE_SCALAR, SPHERE_MODE
     global SHOW_LIC, VIDEO_SECONDS, SHOW_VOLUME, LEVEL_MATCHED_SMOOTHING
-    global SHOW_PARTICLES, VOLUME_MAX_OPACITY, WAKE_OPACITY
+    global SHOW_PARTICLES, VOLUME_MAX_OPACITY, WAKE_OPACITY, SHOW_WAKE
 
     parser = argparse.ArgumentParser(
         description="Reconstrói AMR do MFSim e visualiza o escoamento."
@@ -2846,6 +2851,11 @@ def main():
             "opacidade da superfície de Q/recirculação, entre 0 e 1 "
             f"(padrão: {WAKE_OPACITY:g})"
         ),
+    )
+    parser.add_argument(
+        "--no-wake",
+        action="store_true",
+        help="remove do vídeo a isosuperfície de Q/recirculação",
     )
     parser.add_argument(
         "--force",
@@ -2950,6 +2960,8 @@ def main():
         if not 0.0 <= args.wake_opacity <= 1.0:
             parser.error("--wake-opacity deve estar entre 0 e 1")
         WAKE_OPACITY = args.wake_opacity
+    if args.no_wake:
+        SHOW_WAKE = False
 
     render_video_requested = args.render or args.preview is not None
     selected = (
